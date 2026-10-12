@@ -1,0 +1,30 @@
+[package]
+name = "nexus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "Shared host infrastructure for xtminer and edgecase: config machinery, xmrig-compatible HTTP API core, config hot-reload watcher, notifications dispatcher, stratum framing."
+license = "BSD-3-Clause"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+libc = "0.2"
+arc-swap = "1"
+
+# HTTP client/server support for the API server skeleton and the SMTP
+# dispatcher. tiny_http version pinned to match both miners (0.12).
+tiny_http = "0.12"
+
+# Logging facade: works under both backends (xtminer = log4rs, edgecase =
+# tracing-subscriber's log bridge). The shared crate MUST NOT pull in a
+# logging implementation.
+log = "0.4"
+
+# Email notifications (SMTP) — the shared notification channel.
+lettre = { version = "0.11", default-features = false, features = ["rustls-tls", "smtp-transport", "builder", "tokio1-rustls-tls"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3"
