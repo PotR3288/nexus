@@ -116,6 +116,9 @@ pub fn mask_secrets(v: &mut Value, secrets: &[(&str, &str)]) {
 pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
     let both_tables =
         matches!(base, toml::Value::Table(_)) && matches!(overlay, toml::Value::Table(_));
+    let both_equal_arrays = matches!(base, toml::Value::Array(_))
+        && matches!(overlay, toml::Value::Array(_))
+        && base.as_array().map(|a| a.len()) == overlay.as_array().map(|a| a.len());
     if both_tables {
         // Safe: the match above guarantees both are tables.
         let (b, o) = match (base, overlay) {
@@ -129,6 +132,21 @@ pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
                     b.insert(k.clone(), v.clone());
                 }
             }
+        }
+    } else if both_equal_arrays {
+        // Equal-length arrays merge ELEMENT-WISE: a masked round-trip PUT of
+        // an xmrig-style `[[pool]]` chain (array of tables with `pass = "***"`
+        // where secrets were masked) must not wipe the real credentials on
+        // disk — with element-wise recursion each masked cell keeps its
+        // stored value, exactly like masked scalar fields. Different lengths
+        // mean an actual add/remove edit and fall through to replacement.
+        // Safe: the guard above guarantees both are same-length arrays.
+        let (b, o) = match (base, overlay) {
+            (toml::Value::Array(b), toml::Value::Array(o)) => (b, o),
+            _ => unreachable!(),
+        };
+        for (bv, ov) in b.iter_mut().zip(o.iter()) {
+            deep_merge_toml(bv, ov);
         }
     } else if matches!(overlay, toml::Value::String(s) if s == "***") {
         // Mask token: keep whatever is on disk.
@@ -293,6 +311,51 @@ mod tests {
         let overlay4: toml::Value = "list = [9]\n".parse().unwrap();
         deep_merge_toml(&mut base4, &overlay4);
         assert_eq!(base4["list"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deep_merge_equal_length_arrays_of_tables_merge_element_wise() {
+        // The `[[pool]]` masked-round-trip case: a GET /config (pass masked
+        // to "***") PUT back must keep the real password on disk while
+        // applying any real edits. Equal-length arrays recurse per element;
+        // per-cell mask tokens keep the stored value.
+        let mut base: toml::Value = r#"
+[[pool]]
+url = "a:3333"
+pass = "real-a"
+
+[[pool]]
+url = "b:3333"
+pass = "real-b"
+"#
+        .parse()
+        .unwrap();
+        let overlay: toml::Value = r#"
+[[pool]]
+url = "a:3333"
+pass = "***"
+
+[[pool]]
+url = "CHANGED:3333"
+pass = "***"
+"#
+        .parse()
+        .unwrap();
+        deep_merge_toml(&mut base, &overlay);
+        let pools = base["pool"].as_array().unwrap();
+        assert_eq!(pools[0]["pass"], toml::Value::String("real-a".to_string()));
+        assert_eq!(pools[1]["pass"], toml::Value::String("real-b".to_string()));
+        assert_eq!(
+            pools[1]["url"],
+            toml::Value::String("CHANGED:3333".to_string())
+        );
+
+        // A length change is an add/remove edit → wholesale replacement.
+        let mut base2: toml::Value = "[[pool]]\nurl = \"a\"\n".parse().unwrap();
+        let overlay2: toml::Value =
+            "[[pool]]\nurl = \"a\"\n\n[[pool]]\nurl = \"b\"\n".parse().unwrap();
+        deep_merge_toml(&mut base2, &overlay2);
+        assert_eq!(base2["pool"].as_array().unwrap().len(), 2);
     }
 
     #[test]
