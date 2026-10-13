@@ -14,6 +14,8 @@
 //! - `put_config(body)` — validate + write; the miner owns its Config type.
 //! - `json_rpc(method)` — pause/resume/stop/restart, miner-executed.
 //! - `log_tail(query)` — the /log?lines=N tail (file path is the miner's).
+//! - `events(query)` — the /1/events?limit=N unified event feed (default:
+//!   empty array; a miner adopting the unified vocabulary overrides it).
 //!
 //! Auth mirrors xmrig's Httpd.cpp semantics: with a token configured, a
 //! missing Authorization header is 401 and a wrong one is 403; with no token
@@ -45,6 +47,13 @@ pub trait ApiHooks: Send + Sync {
     fn json_rpc(&self, method: &str, body: &[u8]) -> (u16, Value);
     /// GET /log?lines=N — the log tail, or an error payload.
     fn log_tail(&self, query: &str) -> (u16, Value);
+    /// GET /1/events?limit=N — the unified-vocabulary event tail (nexus
+    /// `notify::Event` JSON). Default hook: empty feed, so a miner that has
+    /// not adopted the unified vocabulary yet answers 200 with `[]` instead
+    /// of 404 — consumers can poll both miners uniformly.
+    fn events(&self, _query: &str) -> Value {
+        json!([])
+    }
 }
 
 /// xmrig's auth semantics (Httpd.cpp): a configured token is required —
@@ -82,8 +91,8 @@ fn unauthorized(code: u16) -> (u16, Value) {
 /// xtminer's (the API contract the GUI depends on):
 ///
 /// 1. POST /json_rpc — own auth gate.
-/// 2. GET /log — own auth gate (before the 405 check, so POST /log answers
-///    405, not 404).
+/// 2. GET /log and GET /1/events — own auth gate (before the 405 check,
+///    so POST /log answers 405, not 404).
 /// 3. GET|PUT /1|2/config — own auth gate (PUT allowed before the 405 check).
 /// 4. Non-GET/PUT → 405 (before auth, matching xmrig).
 /// 5. GET → auth → summary/backends routes.
@@ -116,6 +125,13 @@ pub fn route(
             return unauthorized(code);
         }
         return hooks.log_tail(query);
+    }
+
+    if method == "GET" && path == "/1/events" {
+        if let Err(code) = check_auth(headers, token) {
+            return unauthorized(code);
+        }
+        return (200, hooks.events(query));
     }
 
     if matches!(path, "/1/config" | "/2/config") && matches!(method, "GET" | "PUT") {
@@ -375,6 +391,19 @@ pub fn schedule_restart() {
     schedule_restart_with_failure_prefix("restart:");
 }
 
+/// Parse the `limit=` query parameter for the /1/events feed: default 100,
+/// clamped to [1, 256] (the ring's default capacity — asking for more than
+/// the buffer holds is meaningless, and an unbounded limit would let a
+/// poller allocate freely).
+pub fn events_limit(query: &str) -> usize {
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("limit="))
+        .and_then(|n| n.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 256)
+}
+
 /// Tail of a log file for the GUI log pane (xtminer's /log semantics):
 /// `{"path": …, "lines": […]}`, last N lines in chronological order, N
 /// clamped to [50, 2000] with default 500. Reading on each request is fine —
@@ -529,6 +558,39 @@ mod tests {
         assert_eq!(st, 403);
         let (st, _) = route(&h, "", "GET", "/log?lines=50", &[], b"");
         assert_eq!(st, 200);
+    }
+
+    #[test]
+    fn events_route_gated_by_auth_and_defaults_to_empty() {
+        let h = TestHooks::new();
+        // Auth gates the feed.
+        let (st, _) = route(&h, "secret", "GET", "/1/events", &[], b"");
+        assert_eq!(st, 401);
+        let h_bad = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
+        let (st, _) = route(&h, "secret", "GET", "/1/events", &h_bad, b"");
+        assert_eq!(st, 403);
+        // Default hook answers 200 with an empty array (uniform polling).
+        let (st, v) = route(&h, "", "GET", "/1/events?limit=5", &[], b"");
+        assert_eq!(st, 200);
+        assert_eq!(v, json!([]));
+        // POST → 405 (gated before auth, same as /log).
+        let (st, _) = route(&h, "", "POST", "/1/events", &[], b"");
+        assert_eq!(st, 405);
+    }
+
+    #[test]
+    fn events_limit_parsing_clamps() {
+        let clamp = |q: &str| {
+            q.split('&')
+                .find_map(|kv| kv.strip_prefix("limit="))
+                .and_then(|n| n.parse::<usize>().ok())
+                .unwrap_or(100)
+                .clamp(1, 256)
+        };
+        assert_eq!(clamp(""), 100);
+        assert_eq!(clamp("limit=1"), 1);
+        assert_eq!(clamp("limit=999999"), 256);
+        assert_eq!(clamp("bogus=1"), 100);
     }
 
     #[test]
