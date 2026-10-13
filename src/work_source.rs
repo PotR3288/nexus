@@ -849,6 +849,18 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             .count()
     }
 
+    /// Identities of ALL entries in config order (enabled and disabled) —
+    /// lets consumers diff the live chain against a hot-reloaded one without
+    /// exposing the entries themselves.
+    pub fn pool_identities(&self) -> Vec<String> {
+        self.pools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.identity())
+            .collect()
+    }
+
     /// Monotonic failover counter — used by tests and available for
     /// diagnostics/logging surfaces.
     pub fn failover_count(&self) -> u64 {
@@ -1567,5 +1579,23 @@ mod tests {
         assert_eq!(pm.select().unwrap().index, 0);
         pm.report_success(0);
         assert_eq!(pm.select().unwrap().index, 0);
+    }
+
+    #[test]
+    fn pool_identities_lists_every_entry_in_config_order() {
+        // Disabled entries keep their index — identity diffing must see them
+        // so a hot-reload that flips `enabled` is detected by position.
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::stratum("p:1", "W"),
+            TestEntry::node("http://c"),
+        ]);
+        let ids = pm.pool_identities();
+        assert_eq!(ids.len(), 3);
+        assert!(ids[0].contains("http://a"));
+        assert!(ids[1].contains("p:1"));
+        assert!(ids[2].contains("http://c"));
+        // Distinct login keys → distinct identities (the whole point).
+        assert_ne!(ids[0], ids[2]);
     }
 }
