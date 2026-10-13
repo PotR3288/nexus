@@ -459,6 +459,12 @@ impl Event {
         self.detail = Some(s.into());
         self
     }
+    /// Set `height` only when present (`None` stays omitted — unknown
+    /// height is never serialized as 0).
+    pub fn with_height_opt(mut self, h: Option<u64>) -> Self {
+        self.height = h;
+        self
+    }
     /// Set `detail` only when present (`None` stays omitted).
     pub fn with_detail_opt(mut self, s: Option<String>) -> Self {
         self.detail = s;
