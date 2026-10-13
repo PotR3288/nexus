@@ -11,6 +11,26 @@
 //!
 //! The dedup/episode state (proxy-lost markers) stays in the miners: it is
 //! event-generation policy tied to their own connection state machines.
+//!
+//! # Unified event vocabulary ([`Event`])
+//!
+//! On top of the transport, this module defines the machine-readable event
+//! vocabulary both miners map their internal event enums onto ([`Event`] +
+//! [`EventKind`], [`Rate`], [`EventLog`]). The miners' human-rendered
+//! notifications (email subjects/bodies) stay per-miner on purpose — the
+//! wording is product voice; the STRUCTURED payload is what a GUI/Universe
+//! integration consumes, and that is the part worth unifying:
+//!
+//! - one `kind` tag (stable, snake_case, matchable without version skew),
+//! - timestamps + optional block height as first-class fields,
+//! - rates carry their UNIT ([`RateUnit`]) — H/s and graphs/s are different
+//!   quantities, never coerced,
+//! - "not measured yet" is `None`/empty, never a fake 0.
+
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use lettre::{
     message::header::{HeaderName, HeaderValue},
@@ -301,6 +321,280 @@ impl Channel for EmailChannel {
         });
         // Bounded wait: deliver on a best-effort basis if SMTP stalls.
         let _ = handle.join();
+    }
+}
+
+/// Hashrate unit carried by a [`Rate`]. H/s (RandomX, xtminer) and
+/// graphs/s (Cuckaroo, edgecase) are different physical quantities —
+/// a consumer must never average or compare across units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateUnit {
+    /// RandomX hashes per second.
+    HashesPerSecond,
+    /// Cuckaroo graphs per second.
+    GraphsPerSecond,
+}
+
+/// A hashrate measurement: value + unit + measurement window. A window of
+/// `None` means instantaneous (EMA); `value` is never a fake 0 — omit the
+/// rate entirely when nothing has been measured yet.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Rate {
+    /// Measured rate in the unit below.
+    pub value: f64,
+    /// What the number counts.
+    pub unit: RateUnit,
+    /// Window the rate was measured over, in seconds (`None` = instantaneous
+    /// or EMA-derived).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_secs: Option<u64>,
+}
+
+/// Stable, matchable event kinds for the unified vocabulary. Serializes as
+/// snake_case; new kinds may be added — consumers must ignore unknown ones
+/// (forward compatibility), never fail on them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    /// A solution was found and submitted (block candidate or pool share).
+    SolutionFound,
+    /// The submission was accepted by the pool/proxy/node.
+    SolutionAccepted,
+    /// The submission was rejected, with the reason in `detail`.
+    SolutionRejected,
+    /// Measured hashrate dropped below the alert threshold.
+    HashrateDrop,
+    /// Connection to the work source (proxy/node/pool) was lost.
+    WorkSourceLost,
+    /// Connection to the work source was restored.
+    WorkSourceRestored,
+    /// Periodic status report.
+    PeriodicReport,
+    /// The miner started.
+    MiningStarted,
+    /// The miner stopped.
+    MinerStopped,
+    /// The chain tip has not advanced for longer than the gap threshold.
+    BlockGapDetected,
+}
+
+/// The unified, machine-readable mining event — the struct a GUI/Universe
+/// integration consumes. Built from each miner's internal event enum via
+/// `From` impls living in the miner crates (the miners own the mapping; this
+/// crate owns the shape).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    /// Stable kind tag.
+    pub kind: EventKind,
+    /// Unix time (seconds) the event was recorded.
+    pub ts: u64,
+    /// Template/block height the event refers to, when the source reports
+    /// one. `None` when unknown (e.g. stratum pools carry no height) —
+    /// never 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u64>,
+    /// Nonce of the submitted solution (`SolutionFound`/`SolutionAccepted`/
+    /// `SolutionRejected` only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nonce: Option<u64>,
+    /// Share/solution difficulty as reported by the work source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub difficulty: Option<u64>,
+    /// Hashrate readings attached to the event (periodic reports carry one
+    /// per window; hashrate alerts carry the current + baseline).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rates: Vec<Rate>,
+    /// Work-source identity the event refers to (e.g. "stratum host:port",
+    /// proxy URL, base-node URL) — matches what the miners log.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_source: Option<String>,
+    /// Free-form detail: rejection reason, error text, gap seconds. Kept
+    /// human-readable; structured facts live in the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl Event {
+    /// Build an event stamped with the current Unix time.
+    pub fn now(kind: EventKind) -> Self {
+        Self {
+            kind,
+            ts: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            height: None,
+            nonce: None,
+            difficulty: None,
+            rates: Vec::new(),
+            work_source: None,
+            detail: None,
+        }
+    }
+
+    /// Builder-style setters (chainable), so miner mapping code reads
+    /// declaratively.
+    pub fn with_height(mut self, h: u64) -> Self {
+        self.height = Some(h);
+        self
+    }
+    pub fn with_nonce(mut self, n: u64) -> Self {
+        self.nonce = Some(n);
+        self
+    }
+    pub fn with_difficulty(mut self, d: u64) -> Self {
+        self.difficulty = Some(d);
+        self
+    }
+    pub fn with_rate(mut self, r: Rate) -> Self {
+        self.rates.push(r);
+        self
+    }
+    pub fn with_work_source(mut self, s: impl Into<String>) -> Self {
+        self.work_source = Some(s.into());
+        self
+    }
+    pub fn with_detail(mut self, s: impl Into<String>) -> Self {
+        self.detail = Some(s.into());
+        self
+    }
+    /// Set `detail` only when present (`None` stays omitted).
+    pub fn with_detail_opt(mut self, s: Option<String>) -> Self {
+        self.detail = s;
+        self
+    }
+}
+
+/// Bounded, thread-safe in-memory event ring — the shared backing store for
+/// a `GET /events`-style surface. Newest last. Dropping the oldest entries
+/// when full is intentional: this is a monitoring feed, not an audit log.
+pub struct EventLog {
+    capacity: usize,
+    events: Mutex<VecDeque<Event>>,
+}
+
+impl EventLog {
+    /// New ring holding the most recent `capacity` events.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            events: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Record one event, dropping the oldest when full.
+    pub fn push(&self, event: Event) {
+        let mut q = self.lock();
+        if q.len() >= self.capacity {
+            q.pop_front();
+        }
+        q.push_back(event);
+    }
+
+    /// Snapshot of the last `limit` events, oldest first (`limit` 0 or
+    /// larger than the buffer = everything held).
+    pub fn tail(&self, limit: usize) -> Vec<Event> {
+        let q = self.lock();
+        if limit == 0 || limit >= q.len() {
+            return q.iter().cloned().collect();
+        }
+        q.iter().skip(q.len() - limit).cloned().collect()
+    }
+
+    /// Number of events currently held.
+    pub fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    /// True when no events are held.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn lock(&self) -> MutexGuard<'_, VecDeque<Event>> {
+        self.events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+impl Default for EventLog {
+    fn default() -> Self {
+        // 256 covers hours of normal operation; an outage storm cycles
+        // rather than growing unbounded.
+        Self::new(256)
+    }
+}
+
+#[cfg(test)]
+mod notify_event_tests {
+    use super::*;
+
+    fn hps(value: f64, window: Option<u64>) -> Rate {
+        Rate {
+            value,
+            unit: RateUnit::HashesPerSecond,
+            window_secs: window,
+        }
+    }
+
+    #[test]
+    fn event_serializes_with_stable_snake_case_kind() {
+        let e = Event::now(EventKind::SolutionAccepted)
+            .with_height(940635)
+            .with_nonce(120)
+            .with_difficulty(232);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["kind"], "solution_accepted");
+        assert_eq!(v["height"], 940635);
+        assert_eq!(v["nonce"], 120);
+        // None fields are omitted, not zeroed.
+        assert!(v.get("detail").is_none());
+        assert!(v.get("work_source").is_none());
+    }
+
+    #[test]
+    fn rates_carry_units_and_optional_windows() {
+        let e = Event::now(EventKind::PeriodicReport)
+            .with_rate(hps(1850.5, Some(30)))
+            .with_rate(Rate {
+                value: 4.26,
+                unit: RateUnit::GraphsPerSecond,
+                window_secs: Some(60),
+            });
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["rates"][0]["unit"], "hashes_per_second");
+        assert_eq!(v["rates"][0]["window_secs"], 30);
+        assert_eq!(v["rates"][1]["unit"], "graphs_per_second");
+        // Round-trips through the same shape.
+        let back: Event = serde_json::from_value(v).unwrap();
+        assert_eq!(back.rates.len(), 2);
+        assert_eq!(back.rates[1].unit, RateUnit::GraphsPerSecond);
+    }
+
+    #[test]
+    fn event_log_is_bounded_newest_last_and_tail_limited() {
+        let log = EventLog::new(3);
+        for i in 0..5u64 {
+            log.push(Event::now(EventKind::MiningStarted).with_nonce(i));
+        }
+        assert_eq!(log.len(), 3);
+        let tail = log.tail(10);
+        // Oldest were dropped; order is oldest-first among what remains.
+        assert_eq!(tail[0].nonce, Some(2));
+        assert_eq!(tail[2].nonce, Some(4));
+        // Limit=2 keeps only the two newest.
+        let tail2 = log.tail(2);
+        assert_eq!(tail2.len(), 2);
+        assert_eq!(tail2[0].nonce, Some(3));
+    }
+
+    #[test]
+    fn empty_log_tail_is_empty() {
+        let log = EventLog::default();
+        assert!(log.is_empty());
+        assert!(log.tail(10).is_empty());
     }
 }
 
