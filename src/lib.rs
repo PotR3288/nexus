@@ -14,6 +14,7 @@
 pub mod api;
 pub mod config_util;
 pub mod notify;
+pub mod onboard;
 pub mod stratum;
 pub mod watch;
 pub mod work_source;
