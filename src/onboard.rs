@@ -173,22 +173,22 @@ pub fn endpoint_host_port(endpoint: &str, default_port: u16) -> Option<(String, 
 }
 
 /// TCP-connect to host:port with a bounded timeout. `Ok(true)` = reachable.
-/// Used by `--check` in both miners for pool/stratum endpoints and for the
-/// edgecase base-node gRPC address (proves routing + a listener exists; it
-/// cannot prove protocol correctness, and the detail text must say so).
+/// `Ok(false)` = resolved but refused/timed out (nothing listening). `Err` =
+/// the name did not resolve at all. Used by `--check` in both miners for
+/// pool/stratum endpoints and for the edgecase base-node gRPC address (a pass
+/// proves routing + a listener exists; it cannot prove protocol correctness,
+/// and the detail text must say so).
 pub fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> Result<bool, String> {
     use std::net::ToSocketAddrs;
     let addrs = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("DNS lookup failed for {host}: {e}"))?;
-    let mut last_err: Option<String> = None;
     for addr in addrs {
-        match std::net::TcpStream::connect_timeout(&addr, timeout) {
-            Ok(_) => return Ok(true),
-            Err(e) => last_err = Some(e.to_string()),
+        if std::net::TcpStream::connect_timeout(&addr, timeout).is_ok() {
+            return Ok(true);
         }
     }
-    Err(last_err.unwrap_or_else(|| format!("no addresses resolved for {host}:{port}")))
+    Ok(false)
 }
 
 /// Run a TCP reachability check and fold it into a [`Check`] (shared by both
