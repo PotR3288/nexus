@@ -252,7 +252,11 @@ pub fn validate_and_write<T: serde::de::DeserializeOwned>(
     // Validate the MERGED result before touching disk.
     let cfg: T = match merged.clone().try_into() {
         Ok(c) => c,
-        Err(e) => return Err(format!("rejected before write — invalid config after merge: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "rejected before write — invalid config after merge: {e}"
+            ))
+        }
     };
     extra_validate(&cfg)?;
 
@@ -263,9 +267,7 @@ pub fn validate_and_write<T: serde::de::DeserializeOwned>(
 
     // Atomic replace: temp file in the same directory + rename. The watcher's
     // mtime poll picks it up within ~2s.
-    let dir = Path::new(path)
-        .parent()
-        .unwrap_or_else(|| Path::new("."));
+    let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
     let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
     std::fs::write(&tmp, out).map_err(|e| format!("failed writing temp config: {e}"))?;
     if let Err(e) = std::fs::rename(&tmp, path) {
@@ -352,18 +354,17 @@ pass = "***"
 
         // A length change is an add/remove edit → wholesale replacement.
         let mut base2: toml::Value = "[[pool]]\nurl = \"a\"\n".parse().unwrap();
-        let overlay2: toml::Value =
-            "[[pool]]\nurl = \"a\"\n\n[[pool]]\nurl = \"b\"\n".parse().unwrap();
+        let overlay2: toml::Value = "[[pool]]\nurl = \"a\"\n\n[[pool]]\nurl = \"b\"\n"
+            .parse()
+            .unwrap();
         deep_merge_toml(&mut base2, &overlay2);
         assert_eq!(base2["pool"].as_array().unwrap().len(), 2);
     }
 
     #[test]
     fn json_to_toml_value_round_trips_scalars() {
-        let jv: serde_json::Value = serde_json::from_str(
-            r#"{"n":5,"f":1.5,"s":"x","b":true,"a":[1,2],"z":null}"#,
-        )
-        .unwrap();
+        let jv: serde_json::Value =
+            serde_json::from_str(r#"{"n":5,"f":1.5,"s":"x","b":true,"a":[1,2],"z":null}"#).unwrap();
         let tv = json_to_toml_value(&jv);
         assert_eq!(tv["n"], toml::Value::Integer(5));
         assert_eq!(tv["f"], toml::Value::Float(1.5));
@@ -390,10 +391,7 @@ pass = "***"
     #[test]
     fn delete_toml_path_removes_only_exact_paths() {
         let mut v: toml::Value = "[a]\nx = 1\ny = 2\n[b]\nz = 3\n".parse().unwrap();
-        delete_toml_path(
-            &mut v,
-            &["a".to_string(), "x".to_string()],
-        );
+        delete_toml_path(&mut v, &["a".to_string(), "x".to_string()]);
         assert!(v["a"].get("x").is_none());
         assert_eq!(v["a"]["y"], toml::Value::Integer(2));
         assert_eq!(v["b"]["z"], toml::Value::Integer(3));
@@ -444,30 +442,23 @@ pass = "***"
 
         // Bad value → rejected, file untouched.
         let merged: toml::Value = "threads = \"oops\"".parse().unwrap();
-        let err = validate_and_write::<TestConfig>(
-            path.to_str().unwrap(),
-            &merged,
-            |_| Ok(()),
-        )
-        .unwrap_err();
+        let err = validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| Ok(()))
+            .unwrap_err();
         assert!(err.contains("rejected before write"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "threads = 10\n");
 
         // Extra validation can reject too.
         let merged: toml::Value = "threads = 7".parse().unwrap();
-        let err = validate_and_write::<TestConfig>(
-            path.to_str().unwrap(),
-            &merged,
-            |_| Err("threads must be >= 10".into()),
-        )
+        let err = validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| {
+            Err("threads must be >= 10".into())
+        })
         .unwrap_err();
         assert!(err.contains("threads must be >= 10"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "threads = 10\n");
 
         // Good value → written canonically, no temp leftovers.
         let merged: toml::Value = "threads = 20".parse().unwrap();
-        validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| Ok(()))
-            .unwrap();
+        validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| Ok(())).unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains("threads = 20"), "{written}");
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())

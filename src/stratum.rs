@@ -55,8 +55,7 @@ pub const SUBMIT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 /// read timeout (the reader loop's keepalive cadence depends on reads
 /// timing out between lines).
 pub fn connect(host_port: &str) -> Result<(TcpStream, BufReader<TcpStream>), String> {
-    let stream =
-        TcpStream::connect(host_port).map_err(|e| format!("connect {host_port}: {e}"))?;
+    let stream = TcpStream::connect(host_port).map_err(|e| format!("connect {host_port}: {e}"))?;
     stream
         .set_nodelay(true)
         .map_err(|e| format!("set_nodelay: {e}"))?;
@@ -195,9 +194,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     }
     (0..s.len())
         .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("hex decode: {e}"))
-        })
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| format!("hex decode: {e}")))
         .collect()
 }
 
@@ -239,9 +236,7 @@ pub struct ReaderHooks<J> {
 }
 
 impl<J> ReaderHooks<J> {
-    pub fn new(
-        parse: Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>,
-    ) -> Self {
+    pub fn new(parse: Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>) -> Self {
         Self {
             parse,
             on_share_accepted: Arc::new(|| {}),
@@ -293,18 +288,18 @@ impl<J: Send + Clone + 'static> Session<J> {
             .set_read_timeout(Some(READ_TIMEOUT))
             .map_err(|e| format!("set_read_timeout: {e}"))?;
 
-        let (session_id, first_job) = match login(&mut reader, &mut stream, login_str, password, agent)
-        {
-            Ok(LoginOutcome::Ok { session_id, job }) => (session_id, job),
-            Ok(LoginOutcome::Rejected(e)) => {
-                let _ = stream.shutdown(Shutdown::Both);
-                return Err(e);
-            }
-            Err(e) => {
-                let _ = stream.shutdown(Shutdown::Both);
-                return Err(e);
-            }
-        };
+        let (session_id, first_job) =
+            match login(&mut reader, &mut stream, login_str, password, agent) {
+                Ok(LoginOutcome::Ok { session_id, job }) => (session_id, job),
+                Ok(LoginOutcome::Rejected(e)) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(e);
+                }
+                Err(e) => {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    return Err(e);
+                }
+            };
         info!("Stratum login OK (session {session_id})");
 
         let job_slot: Arc<Mutex<Option<J>>> = Arc::new(Mutex::new(None));
@@ -705,7 +700,11 @@ mod tests {
         let hooks = ReaderHooks {
             parse: Arc::new(|raw: &Value, _nw: u8| {
                 // Trivial "job" type for the test.
-                Ok(raw.get("job_id").and_then(Value::as_str).unwrap_or("").to_string())
+                Ok(raw
+                    .get("job_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string())
             }),
             on_share_accepted: {
                 let a = Arc::clone(&accepted);
@@ -781,7 +780,10 @@ mod tests {
             .unwrap();
         let mut probe = String::new();
         let n = s_reader.read_line(&mut probe).unwrap_or(0);
-        assert_eq!(n, 0, "keepalive must be disabled after unknown-method reply");
+        assert_eq!(
+            n, 0,
+            "keepalive must be disabled after unknown-method reply"
+        );
         s_stream.set_read_timeout(None).unwrap();
 
         // Push a job.

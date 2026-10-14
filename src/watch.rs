@@ -225,7 +225,12 @@ pub fn f64_changed(a: f64, b: f64) -> bool {
 }
 
 /// `{name}: {old} → {new}` when different (the shared diff-line format).
-pub fn diff_line<T: PartialEq + std::fmt::Display>(old: T, new: T, name: &str, out: &mut Vec<String>) {
+pub fn diff_line<T: PartialEq + std::fmt::Display>(
+    old: T,
+    new: T,
+    name: &str,
+    out: &mut Vec<String>,
+) {
     if old != new {
         out.push(format!("{name}: {old} → {new}"));
     }
@@ -256,11 +261,13 @@ mod tests {
     }
 
     fn loader() -> Arc<dyn Fn(&str) -> Result<TestConfig, LoadError> + Send + Sync> {
-        Arc::new(|p: &str| match crate::config_util::load_toml_config::<TestConfig>(p) {
-            crate::config_util::ConfigLoad::Loaded(c) => Ok(c),
-            crate::config_util::ConfigLoad::NotFound => Err(LoadError::NotFound),
-            crate::config_util::ConfigLoad::Error(e) => Err(LoadError::Parse(e)),
-        })
+        Arc::new(
+            |p: &str| match crate::config_util::load_toml_config::<TestConfig>(p) {
+                crate::config_util::ConfigLoad::Loaded(c) => Ok(c),
+                crate::config_util::ConfigLoad::NotFound => Err(LoadError::NotFound),
+                crate::config_util::ConfigLoad::Error(e) => Err(LoadError::Parse(e)),
+            },
+        )
     }
 
     fn hooks() -> ReloadHooks<TestConfig> {

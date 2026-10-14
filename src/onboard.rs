@@ -50,7 +50,11 @@ impl Check {
         }
     }
 
-    pub fn warn(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub fn warn(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             status: Status::Warn,
@@ -59,7 +63,11 @@ impl Check {
         }
     }
 
-    pub fn fail(name: impl Into<String>, detail: impl Into<String>, hint: impl Into<String>) -> Self {
+    pub fn fail(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        hint: impl Into<String>,
+    ) -> Self {
         Self {
             name: name.into(),
             status: Status::Fail,
@@ -194,12 +202,7 @@ pub fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> Res
 /// Run a TCP reachability check and fold it into a [`Check`] (shared by both
 /// miners' `--check` for pool endpoints / base-node addresses). A success
 /// proves routing + a listening socket, NOT protocol correctness.
-pub fn endpoint_check(
-    name: &str,
-    endpoint: &str,
-    default_port: u16,
-    protocol_note: &str,
-) -> Check {
+pub fn endpoint_check(name: &str, endpoint: &str, default_port: u16, protocol_note: &str) -> Check {
     match endpoint_host_port(endpoint, default_port) {
         None => Check::fail(
             name,
@@ -303,8 +306,7 @@ pub fn write_config_atomic(path: &Path, content: &str) -> Result<(), String> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let tmp = dir.join(format!(
         ".{}.wizard-tmp",
         path.file_name()
@@ -339,7 +341,11 @@ mod tests {
         assert_eq!(r.failures(), 0);
         assert!(r.render().contains("All checks passed"));
 
-        r.push(Check::warn("hugepages", "not raised", "echo vm.nr_hugepages=..."));
+        r.push(Check::warn(
+            "hugepages",
+            "not raised",
+            "echo vm.nr_hugepages=...",
+        ));
         assert_eq!(r.failures(), 0);
         assert!(r.render().contains("warning(s)"));
         assert!(r.render().contains("fix:"));

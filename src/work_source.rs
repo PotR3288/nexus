@@ -407,7 +407,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                 Self::select_locked(&pools, &cands, active_idx).map(|s| s.index)
             };
             if index == active_idx || Some(index) == selected_idx {
-                self.connected_urls.lock().unwrap().insert(p.url().to_string());
+                self.connected_urls
+                    .lock()
+                    .unwrap()
+                    .insert(p.url().to_string());
             }
         }
         // Clear the failure/cooldown state; this entry has now PROVEN its
@@ -971,10 +974,22 @@ mod tests {
 
     #[test]
     fn work_source_parses_both_vocabularies() {
-        assert_eq!(WorkSource::parse("node", WorkSource::Stratum), Some(WorkSource::Node));
-        assert_eq!(WorkSource::parse("proxy", WorkSource::Stratum), Some(WorkSource::Proxy));
-        assert_eq!(WorkSource::parse("stratum", WorkSource::Node), Some(WorkSource::Stratum));
-        assert_eq!(WorkSource::parse("", WorkSource::Node), Some(WorkSource::Node));
+        assert_eq!(
+            WorkSource::parse("node", WorkSource::Stratum),
+            Some(WorkSource::Node)
+        );
+        assert_eq!(
+            WorkSource::parse("proxy", WorkSource::Stratum),
+            Some(WorkSource::Proxy)
+        );
+        assert_eq!(
+            WorkSource::parse("stratum", WorkSource::Node),
+            Some(WorkSource::Stratum)
+        );
+        assert_eq!(
+            WorkSource::parse("", WorkSource::Node),
+            Some(WorkSource::Node)
+        );
         assert_eq!(WorkSource::parse("bogus", WorkSource::Node), None);
         assert_eq!(WorkSource::Node.to_string(), "node");
         assert_eq!(WorkSource::Proxy.to_string(), "proxy");
@@ -995,7 +1010,10 @@ mod tests {
 
     #[test]
     fn fails_over_after_threshold() {
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert_eq!(pm.candidate_count(), 2);
         assert_eq!(pm.report_failure(0), Some(0));
         assert_eq!(pm.report_failure(0), Some(0));
@@ -1010,7 +1028,10 @@ mod tests {
 
     #[test]
     fn success_resets_failure_count() {
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_failure(0);
         pm.report_failure(0);
         pm.report_success(0); // reset
@@ -1074,7 +1095,10 @@ mod tests {
     fn cross_type_failover_node_to_stratum_and_back() {
         // A node chain that falls through to a stratum pool — the whole point
         // of one mixed failover list.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::stratum("xtm-rx:7038", "W")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::stratum("xtm-rx:7038", "W"),
+        ]);
         for _ in 0..FAIL_THRESHOLD {
             pm.report_failure(0);
         }
@@ -1099,14 +1123,20 @@ mod tests {
 
     #[test]
     fn replace_resets_state_and_reselects() {
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         // Trip a's cooldown.
         for _ in 0..FAIL_THRESHOLD {
             pm.report_failure(0);
         }
         assert_eq!(pm.select().unwrap().index, 1);
         // Hot-reload with the same list: state resets → back to primary.
-        let _ = pm.replace(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert_eq!(pm.select().unwrap().index, 0);
 
         // Disabling the primary live moves selection to the next entry.
@@ -1131,7 +1161,10 @@ mod tests {
         // that cannot be reached. Selection must revert to the previously
         // working entry at once — one strike, not three — and display must
         // never advertise the dead entry as active.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a is verified (the miner was working on it)
 
         // Hot-reload: new primary c (unreachable), old entry a demoted to #2.
@@ -1151,7 +1184,10 @@ mod tests {
         assert_eq!(sel.index, 1);
         assert_eq!(sel.pool.url(), "http://a");
         // Display is truthful again: a is verified and active.
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
     }
 
     #[test]
@@ -1163,11 +1199,17 @@ mod tests {
         // working fallback keeps being selected for the whole window; after
         // REVERT_COOLDOWN expires, the entry is re-qualified for ONE probe
         // per cooldown cycle (see reverted_pool_fails_back_after_cooldown_expiry).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a working
 
         // Hot-reload: new primary c (unreachable), old entry a demoted to #2.
-        let _ = pm.replace(vec![TestEntry::node("http://c"), TestEntry::node("http://a")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://c"),
+            TestEntry::node("http://a"),
+        ]);
         assert_eq!(pm.report_failure(0), Some(1)); // revert to a at once
 
         // The failed entry's cooldown extends well past the normal failover
@@ -1176,7 +1218,9 @@ mod tests {
             let cands = pm.candidates.lock().unwrap();
             let until = cands[0].retry_at_ms.load(Ordering::Relaxed);
             assert!(
-                until >= PoolManager::<TestEntry>::now_ms() + REVERT_COOLDOWN.as_millis() as u64 - 1000,
+                until
+                    >= PoolManager::<TestEntry>::now_ms() + REVERT_COOLDOWN.as_millis() as u64
+                        - 1000,
                 "revert cooldown must be at least REVERT_COOLDOWN long"
             );
         }
@@ -1184,7 +1228,10 @@ mod tests {
 
         // A config reload resets all state — c becomes selectable again (and
         // will revert once more if it still cannot connect).
-        let _ = pm.replace(vec![TestEntry::node("http://c"), TestEntry::node("http://a")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://c"),
+            TestEntry::node("http://a"),
+        ]);
         assert_eq!(pm.select().unwrap().index, 0);
     }
 
@@ -1198,7 +1245,10 @@ mod tests {
         // cooldown (bounded cost: one probe per cycle, not per-minute
         // ping-pong). Before this, `reverted` was a dead-end lockout: only a
         // config reload could give the entry another chance.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(1); // fallback b is the verified one
 
         // Primary a is unreachable → one strike reverts to b.
@@ -1242,17 +1292,29 @@ mod tests {
         // and the hashrate line flickering to "none" on every blip is exactly
         // what this set exists to prevent. Only ABANDONMENT (threshold
         // failover / revert) removes an entry from the display.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a is working and advertised
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
 
         // One failed probe — below the failover threshold.
         assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
 
         // Recovery re-proves it (no-op on the set, but must not break it).
         pm.report_success(0);
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
     }
 
     #[test]
@@ -1260,9 +1322,15 @@ mod tests {
         // Once an entry is actually ABANDONED (threshold failover), the
         // display must not keep advertising it — and must show "none" until
         // the new selection proves its connection.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a working
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
 
         // Three strikes → fail over to b.
         for _ in 0..FAIL_THRESHOLD {
@@ -1274,7 +1342,10 @@ mod tests {
 
         // b proves its connection → now b is the active entry on display.
         pm.report_success(1);
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://b".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://b".to_string())
+        );
     }
 
     #[test]
@@ -1283,17 +1354,26 @@ mod tests {
         // advertising it — its connection cannot be live if it no longer
         // exists. Entries still in the chain keep their status (an unrelated
         // edit must not make a healthy session display as "none").
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a working and advertised
 
         // Reload: b removed, a stays primary.
         let _ = pm.replace(vec![TestEntry::node("http://a")]);
-        assert_eq!(pm.active_pool().map(|p| p.url().to_string()), Some("http://a".to_string()));
+        assert_eq!(
+            pm.active_pool().map(|p| p.url().to_string()),
+            Some("http://a".to_string())
+        );
 
         // Reload: a demoted behind new primary c (unreachable). a's status is
         // kept (still in the chain) but it is no longer active — and c was
         // never connected, so nothing may be advertised.
-        let _ = pm.replace(vec![TestEntry::node("http://c"), TestEntry::node("http://a")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://c"),
+            TestEntry::node("http://a"),
+        ]);
         assert!(pm.active_pool().is_none());
     }
 
@@ -1303,7 +1383,10 @@ mod tests {
         // failing over — a working source blipping is normal and must not
         // instantly abandon the primary (that would flap on every transient
         // error).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a verified
         assert_eq!(pm.report_failure(0), Some(0));
         assert_eq!(pm.report_failure(0), Some(0));
@@ -1315,7 +1398,10 @@ mod tests {
         // Nothing has ever connected: every candidate is equally unproven, so
         // the normal threshold applies (no instant revert to a "working"
         // entry that doesn't exist yet).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert_eq!(pm.report_failure(0), Some(0));
         assert_eq!(pm.report_failure(0), Some(0));
         assert_eq!(pm.report_failure(0), Some(1)); // threshold → b, as before
@@ -1323,7 +1409,10 @@ mod tests {
 
     #[test]
     fn replace_returns_previous_active_index() {
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(1); // active is now b (index 1)
         let prev = pm.replace(vec![TestEntry::node("http://c")]);
         assert_eq!(prev, Some(1));
@@ -1339,7 +1428,10 @@ mod tests {
         }
         let sel = pm.select().unwrap();
         assert_eq!(sel.pool.url(), "xtm-rx:7038");
-        assert_eq!(sel.pool.identity(), format!("xtm-rx:7038\u{0}stratum\u{0}WALLET"));
+        assert_eq!(
+            sel.pool.identity(),
+            format!("xtm-rx:7038\u{0}stratum\u{0}WALLET")
+        );
     }
 
     #[test]
@@ -1347,7 +1439,10 @@ mod tests {
         // The broken-validator case: the source serves jobs fine (connection
         // alive) but rejects every share. Rejections must fail over after
         // REJECT_THRESHOLD — not FAIL_THRESHOLD, and not never.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0)); // stay put
         }
@@ -1362,12 +1457,15 @@ mod tests {
     fn accepted_share_clears_the_rejection_streak() {
         // Sporadic rejections (stale jobs after a reorg) must not accumulate:
         // an acceptance resets the streak.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
         }
         pm.clear_share_rejections(0); // one accepted share
-        // The streak restarted — the same number of rejections no longer trips.
+                                      // The streak restarted — the same number of rejections no longer trips.
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
         }
@@ -1381,12 +1479,15 @@ mod tests {
         // work fetch would otherwise zero it before the submit rejection
         // could accumulate — and "serves work but cannot validate" is exactly
         // the condition this counter exists to catch.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
         }
         pm.report_success(0); // healthy work fetch on the same entry
-        // The streak survived — one more rejection trips it.
+                              // The streak survived — one more rejection trips it.
         assert_eq!(pm.report_share_rejection(0), Some(1));
     }
 
@@ -1394,11 +1495,17 @@ mod tests {
     fn replace_resets_the_rejection_streak() {
         // A config reload gives a reloaded chain fresh strikes (the source
         // may have fixed its validator in the meantime).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
         }
-        let _ = pm.replace(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         // Streak reset — the same number of rejections no longer trips.
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
@@ -1411,9 +1518,15 @@ mod tests {
         // An unrelated reload (no field edits) must keep was_verified — the
         // revert rule depends on remembering which entry actually served
         // work.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a verified + connected
-        let _ = pm.replace(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert!(pm.last_verified_index() == Some(0));
     }
 
@@ -1422,7 +1535,10 @@ mod tests {
         // Editing wallet (or any login key) on an entry makes its credentials
         // unproven: verified status does NOT carry across the reload, and the
         // revert rule must not treat the edited entry as known-good.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0); // a verified with the OLD wallet
         let mut a = TestEntry::node("http://a");
         a.wallet = "renamed".to_string();
@@ -1447,13 +1563,19 @@ mod tests {
         // Standby surgery: disabling then re-enabling an entry does NOT wipe
         // its verified history — the credentials are unchanged, so the revert
         // rule still knows this entry served work.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0);
         let mut off = TestEntry::node("http://a");
         off.enabled = false;
         let _ = pm.replace(vec![off, TestEntry::node("http://b")]);
         assert_eq!(pm.select().unwrap().index, 1); // mining moved to b
-        let _ = pm.replace(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert_eq!(pm.last_verified_index(), Some(0)); // history survived
     }
 
@@ -1462,7 +1584,10 @@ mod tests {
         // enabled=false on the entry we are mining on must be a trigger: the
         // next select() points elsewhere, so the selection watcher fires and
         // the in-flight job window aborts (same path as a pool switch).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         pm.report_success(0);
         assert_eq!(pm.select().unwrap().index, 0);
         let mut off = TestEntry::node("http://a");
@@ -1481,7 +1606,10 @@ mod tests {
         // working fallback keeps being selected for the whole window; a
         // config reload resets state at once (and the entry gets another
         // chance).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD {
             pm.report_share_rejection(0);
         }
@@ -1493,7 +1621,9 @@ mod tests {
             let cands = pm.candidates.lock().unwrap();
             let until = cands[0].retry_at_ms.load(Ordering::Relaxed);
             assert!(
-                until >= PoolManager::<TestEntry>::now_ms() + REJECT_COOLDOWN.as_millis() as u64 - 1000,
+                until
+                    >= PoolManager::<TestEntry>::now_ms() + REJECT_COOLDOWN.as_millis() as u64
+                        - 1000,
                 "rejection ban must use at least REJECT_COOLDOWN"
             );
         }
@@ -1514,7 +1644,10 @@ mod tests {
 
         // A config reload resets all state — a becomes selectable again (and
         // will be banned once more if it still rejects).
-        let _ = pm.replace(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let _ = pm.replace(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         assert_eq!(pm.select().unwrap().index, 0);
     }
 
@@ -1524,7 +1657,10 @@ mod tests {
         // works again — the streak resets and the entry is eligible for
         // selection as soon as its cooldown expires (no further strikes
         // owed).
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::node("http://b")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::node("http://b"),
+        ]);
         for _ in 0..REJECT_THRESHOLD {
             pm.report_share_rejection(0);
         }
@@ -1563,7 +1699,10 @@ mod tests {
     fn fail_immediately_rotates_past_the_failed_entry() {
         // Login rejection is one strike: even with the threshold untripped,
         // selection moves to the next candidate at once.
-        let pm = chain(vec![TestEntry::node("http://a"), TestEntry::stratum("p:1", "W")]);
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::stratum("p:1", "W"),
+        ]);
         pm.report_success(0); // a verified and active
         assert_eq!(pm.fail_immediately(0), Some(1));
         assert_eq!(pm.failover_count(), 1);

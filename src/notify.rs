@@ -199,10 +199,9 @@ impl EmailChannel {
             .subject(subject);
 
         for addr in &self.to_addresses {
-            msg_builder = msg_builder.to(
-                addr.parse()
-                    .map_err(|e| format!("Invalid to address '{addr}': {e}"))?,
-            );
+            msg_builder = msg_builder.to(addr
+                .parse()
+                .map_err(|e| format!("Invalid to address '{addr}': {e}"))?);
         }
 
         msg_builder

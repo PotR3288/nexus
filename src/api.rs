@@ -21,7 +21,7 @@
 //! missing Authorization header is 401 and a wrong one is 403; with no token
 //! configured requests are allowed (both miners bind loopback only).
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
@@ -251,7 +251,9 @@ fn read_request(
     if content_length > body.len() {
         let missing = content_length - body.len();
         body.resize(content_length, 0);
-        stream.read_exact(&mut body[(content_length - missing)..]).ok()?;
+        stream
+            .read_exact(&mut body[(content_length - missing)..])
+            .ok()?;
     } else {
         // Pipelined extra bytes beyond this request's body are ignored —
         // the responder always answers Connection: close.
@@ -309,8 +311,7 @@ pub fn spawn_server(
                                 {
                                     return;
                                 }
-                                let (method, url, headers, body) = match read_request(&mut stream)
-                                {
+                                let (method, url, headers, body) = match read_request(&mut stream) {
                                     Some(req) => req,
                                     None => return, // timeout or malformed — close
                                 };
