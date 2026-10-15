@@ -1,4 +1,4 @@
-// Copyright (c) 2026 The Tari Project
+// Copyright (c) 2026 PotR3288
 // SPDX-License-Identifier: BSD-3-Clause
 
 //! Multi-work-source failover across an ordered `[[pool]]` chain.

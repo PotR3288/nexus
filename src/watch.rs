@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Config hot-reload machinery shared by xtminer and edgecase.
 //!
 //! Ported verbatim from xtminer's config_watch.rs (edgecase's copy already

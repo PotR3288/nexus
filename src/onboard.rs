@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Onboarding helpers shared by xtminer and edgecase: a self-check report
 //! framework and first-run wizard prompt helpers.
 //!

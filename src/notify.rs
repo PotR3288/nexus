@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Channel-agnostic mining-event notifications shared by xtminer and
 //! edgecase.
 //!

@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Monero-dialect stratum framing core shared by xtminer and edgecase.
 //!
 //! Both miners speak the Monero pool protocol (the dialect unmodified xmrig

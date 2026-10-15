@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Config-file machinery shared by xtminer and edgecase.
 //!
 //! Extracted from the API-parity work both miners carry as near-copies

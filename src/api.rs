@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! xmrig-compatible HTTP status API core shared by xtminer and edgecase.
 //!
 //! Both miners had drifted into near-copies of the same server (xtminer's

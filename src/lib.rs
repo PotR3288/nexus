@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Shared host infrastructure for xtminer and edgecase.
 //!
 //! Everything in this crate is host plumbing both miners need identically:
