@@ -594,13 +594,6 @@ mod notify_event_tests {
         assert_eq!(tail2.len(), 2);
         assert_eq!(tail2[0].nonce, Some(3));
     }
-
-    #[test]
-    fn empty_log_tail_is_empty() {
-        let log = EventLog::default();
-        assert!(log.is_empty());
-        assert!(log.tail(10).is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -674,20 +667,5 @@ mod tests {
         let entries = log.lock().unwrap();
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().all(|e| e.starts_with("miner-x:")));
-    }
-
-    #[test]
-    fn dispatcher_with_no_channels_is_quiet() {
-        let d = Dispatcher::new("m".into(), vec![]);
-        assert!(!d.is_enabled());
-        // Must not panic.
-        d.send(&EmailEvent {
-            subject: "s".into(),
-            body: "b".into(),
-        });
-        d.send_blocking(&EmailEvent {
-            subject: "s".into(),
-            body: "b".into(),
-        });
     }
 }

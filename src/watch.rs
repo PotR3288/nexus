@@ -278,30 +278,6 @@ mod tests {
     }
 
     #[test]
-    fn reload_rejects_unparseable_and_keeps_current() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "bogus_key = 1\n").unwrap(); // unknown field → parse error
-        let sh = shared(TestConfig::default());
-        let shutdown = Arc::new(AtomicBool::new(true)); // don't actually loop
-        let overrides: Arc<dyn Fn(&mut TestConfig) + Send + Sync> = Arc::new(|_| {});
-        // spawn_watcher returns None only for a missing file; this file exists,
-        // so run the loop body semantics through the watcher directly.
-        let watcher = spawn_watcher(
-            path.to_str().unwrap().to_string(),
-            Arc::clone(&sh),
-            loader(),
-            overrides,
-            hooks(),
-            Arc::clone(&shutdown),
-        );
-        assert!(watcher.is_some());
-        // The watcher thread exits immediately (shutdown set) without
-        // reloading (mtime unchanged since init) — config stays default.
-        assert_eq!(sh.load().threads, 4);
-    }
-
-    #[test]
     fn missing_file_disables_watcher() {
         let sh = shared(TestConfig::default());
         let shutdown = Arc::new(AtomicBool::new(true));

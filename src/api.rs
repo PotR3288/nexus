@@ -630,17 +630,11 @@ mod tests {
 
     #[test]
     fn events_limit_parsing_clamps() {
-        let clamp = |q: &str| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("limit="))
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(100)
-                .clamp(1, 256)
-        };
-        assert_eq!(clamp(""), 100);
-        assert_eq!(clamp("limit=1"), 1);
-        assert_eq!(clamp("limit=999999"), 256);
-        assert_eq!(clamp("bogus=1"), 100);
+        // The real parser: default 100, clamped to [1, 256].
+        assert_eq!(events_limit(""), 100);
+        assert_eq!(events_limit("limit=1"), 1);
+        assert_eq!(events_limit("limit=999999"), 256);
+        assert_eq!(events_limit("bogus=1"), 100);
     }
 
     #[test]
@@ -660,16 +654,8 @@ mod tests {
         assert_eq!(arr[0], "line 151");
         assert_eq!(arr[99], "line 250");
 
-        // Clamp bounds.
-        let clamp = |q: &str| {
-            q.split('&')
-                .find_map(|kv| kv.strip_prefix("lines="))
-                .and_then(|n| n.parse::<usize>().ok())
-                .unwrap_or(500)
-                .clamp(50, 2000)
-        };
-        assert_eq!(clamp(""), 500);
-        assert_eq!(clamp("lines=1"), 50);
-        assert_eq!(clamp("lines=999999"), 2000);
+        // The real clamp (lower bound): lines=1 still returns at least 50.
+        let (_, v) = log_tail_of_file("lines=1", &path);
+        assert_eq!(v["lines"].as_array().unwrap().len(), 50);
     }
 }

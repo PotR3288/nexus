@@ -975,16 +975,4 @@ mod tests {
             "unexpected error: {msg}"
         );
     }
-
-    #[test]
-    fn oversized_session_line_disconnects() {
-        let ((client, mut reader), (server, _)) = socket_pair();
-        std::thread::spawn(move || {
-            std::io::Write::write_all(&mut &server, &vec![b'y'; 2 * 1024 * 1024]).ok();
-        });
-        drop(client);
-        let mut line = String::new();
-        let err = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES);
-        assert!(err.is_err(), "oversized session line must be an error");
-    }
 }

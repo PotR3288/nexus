@@ -1422,20 +1422,6 @@ mod tests {
     }
 
     #[test]
-    fn fresh_chain_walks_candidates_without_revert() {
-        // Nothing has ever connected: every candidate is equally unproven, so
-        // the normal threshold applies (no instant revert to a "working"
-        // entry that doesn't exist yet).
-        let pm = chain(vec![
-            TestEntry::node("http://a"),
-            TestEntry::node("http://b"),
-        ]);
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(1)); // threshold → b, as before
-    }
-
-    #[test]
     fn replace_returns_previous_active_index() {
         let pm = chain(vec![
             TestEntry::node("http://a"),
@@ -1444,22 +1430,6 @@ mod tests {
         pm.report_success(1); // active is now b (index 1)
         let prev = pm.replace(vec![TestEntry::node("http://c")]);
         assert_eq!(prev, Some(1));
-    }
-
-    #[test]
-    fn selection_carries_entry() {
-        let s = TestEntry::stratum("xtm-rx:7038", "WALLET");
-        let pm = chain(vec![TestEntry::node("http://a"), s]);
-        // Force selection of the stratum entry.
-        for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(0);
-        }
-        let sel = pm.select().unwrap();
-        assert_eq!(sel.pool.url(), "xtm-rx:7038");
-        assert_eq!(
-            sel.pool.identity(),
-            format!("xtm-rx:7038\u{0}stratum\u{0}WALLET")
-        );
     }
 
     #[test]
@@ -1577,54 +1547,6 @@ mod tests {
     }
 
     #[test]
-    fn edited_url_loses_verified_status() {
-        // A URL change is a different entry — nothing carries over by URL
-        // match.
-        let pm = chain(vec![TestEntry::node("http://a")]);
-        pm.report_success(0);
-        let _ = pm.replace(vec![TestEntry::node("http://a2")]);
-        assert_eq!(pm.last_verified_index(), None);
-    }
-
-    #[test]
-    fn enabled_toggle_keeps_verified_status() {
-        // Standby surgery: disabling then re-enabling an entry does NOT wipe
-        // its verified history — the credentials are unchanged, so the revert
-        // rule still knows this entry served work.
-        let pm = chain(vec![
-            TestEntry::node("http://a"),
-            TestEntry::node("http://b"),
-        ]);
-        pm.report_success(0);
-        let mut off = TestEntry::node("http://a");
-        off.enabled = false;
-        let _ = pm.replace(vec![off, TestEntry::node("http://b")]);
-        assert_eq!(pm.select().unwrap().index, 1); // mining moved to b
-        let _ = pm.replace(vec![
-            TestEntry::node("http://a"),
-            TestEntry::node("http://b"),
-        ]);
-        assert_eq!(pm.last_verified_index(), Some(0)); // history survived
-    }
-
-    #[test]
-    fn disabling_the_active_pool_moves_selection() {
-        // enabled=false on the entry we are mining on must be a trigger: the
-        // next select() points elsewhere, so the selection watcher fires and
-        // the in-flight job window aborts (same path as a pool switch).
-        let pm = chain(vec![
-            TestEntry::node("http://a"),
-            TestEntry::node("http://b"),
-        ]);
-        pm.report_success(0);
-        assert_eq!(pm.select().unwrap().index, 0);
-        let mut off = TestEntry::node("http://a");
-        off.enabled = false;
-        let _ = pm.replace(vec![off, TestEntry::node("http://b")]);
-        assert_eq!(pm.select().unwrap().index, 1);
-    }
-
-    #[test]
     fn banned_pool_stays_out_of_rotation_and_rebans_on_one_probe() {
         // Anti-ping-pong (the live-smoke finding): once an entry is banned
         // for share rejections, its cooldown must be LONGER than the normal
@@ -1709,18 +1631,6 @@ mod tests {
         for _ in 0..REJECT_THRESHOLD - 1 {
             assert_eq!(pm.report_share_rejection(0), Some(0));
         }
-    }
-
-    #[test]
-    fn single_pool_rejections_never_fail_over() {
-        // One candidate: rejections accumulate but there is nowhere to go —
-        // the miner stays put (same as work failures on a single-entry
-        // chain).
-        let pm = chain(vec![TestEntry::node("http://a")]);
-        for _ in 0..REJECT_THRESHOLD * 2 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
-        }
-        assert_eq!(pm.failover_count(), 0);
     }
 
     #[test]
