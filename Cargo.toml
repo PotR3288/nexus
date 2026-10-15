@@ -17,9 +17,10 @@ arc-swap = "1"
 # dispatcher. tiny_http version pinned to match both miners (0.12).
 tiny_http = "0.12"
 
-# Logging facade: works under both backends (xtminer = log4rs, edgecase =
-# tracing-subscriber's log bridge). The shared crate MUST NOT pull in a
-# logging implementation.
+# Logging facade: both miners run tracing subscribers, and
+# tracing-subscriber's .init() installs the tracing-log bridge that forwards
+# these log:: events into them (verified live in both xtminer and edgecase).
+# The shared crate MUST NOT pull in a logging implementation.
 log = "0.4"
 
 # Email notifications (SMTP) — the shared notification channel.
