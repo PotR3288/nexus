@@ -864,6 +864,20 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             .collect()
     }
 
+    /// Same as [`Self::pool_identities`], but each identity is paired with the
+    /// entry's `enabled` flag. Diffing on this catches a hot-reload that ONLY
+    /// toggles `enabled` — identity deliberately excludes the flag (reload_key
+    /// carryover semantics), so an identity-only diff would silently drop an
+    /// enable/disable edit.
+    pub fn pool_identity_enabled(&self) -> Vec<(String, bool)> {
+        self.pools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| (p.identity(), p.enabled()))
+            .collect()
+    }
+
     /// Monotonic failover counter — used by tests and available for
     /// diagnostics/logging surfaces.
     pub fn failover_count(&self) -> u64 {
@@ -946,6 +960,14 @@ mod tests {
                 ws: WorkSource::Stratum,
                 wallet: wallet.to_string(),
                 enabled: true,
+            }
+        }
+        fn stratum_disabled(url: &str, wallet: &str) -> Self {
+            Self {
+                url: url.to_string(),
+                ws: WorkSource::Stratum,
+                wallet: wallet.to_string(),
+                enabled: false,
             }
         }
     }
@@ -1736,5 +1758,25 @@ mod tests {
         assert!(ids[2].contains("http://c"));
         // Distinct login keys → distinct identities (the whole point).
         assert_ne!(ids[0], ids[2]);
+    }
+
+    #[test]
+    fn pool_identity_enabled_carries_the_flag() {
+        // The (identity, enabled) pairs let consumers detect an
+        // enabled-only toggle that identity() alone cannot represent.
+        let pm = chain(vec![
+            TestEntry::node("http://a"),
+            TestEntry::stratum("p:1", "W"),
+        ]);
+        let pairs = pm.pool_identity_enabled();
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs[0].1, "node default enabled");
+        assert!(pairs[1].1, "stratum default enabled");
+
+        let pm2 = chain(vec![TestEntry::stratum_disabled("p:1", "W")]);
+        let pairs2 = pm2.pool_identity_enabled();
+        assert_eq!(pairs2.len(), 1);
+        assert!(!pairs2[0].1, "disabled entry carries enabled=false");
+        assert_eq!(pairs2[0].0, pairs[1].0, "same identity, different flag");
     }
 }
