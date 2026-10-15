@@ -82,10 +82,6 @@ pub fn send_message(stream: &mut TcpStream, value: &Value) -> Result<(), String>
         .map_err(|e| format!("send failed: {e}"))
 }
 
-/// Build the stratum login string: `WALLET[SEPARATOR]WORKER`. An empty
-/// worker id sends the bare wallet — some pools (e.g. snipanet) parse the
-/// whole field as an address and reject any suffix, even a trailing
-/// separator.
 /// Read one `\n`-terminated line into `line`, consuming at most `cap` bytes.
 ///
 /// The bounded replacement for `BufRead::read_line`: a pool sending an
@@ -151,6 +147,10 @@ fn memchr(buf: &[u8], needle: u8) -> Option<usize> {
     buf.iter().position(|&b| b == needle)
 }
 
+/// Build the stratum login string: `WALLET[SEPARATOR]WORKER`. An empty
+/// worker id sends the bare wallet — some pools (e.g. snipanet) parse the
+/// whole field as an address and reject any suffix, even a trailing
+/// separator.
 pub fn login_string(wallet: &str, worker_id: &str, separator: &str) -> String {
     if worker_id.is_empty() {
         wallet.to_string()
