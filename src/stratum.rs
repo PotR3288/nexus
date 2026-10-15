@@ -46,6 +46,13 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Login response deadline.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Maximum bytes for a single stratum line (login replies AND session
+/// pushes/replies). A malicious or broken pool must not be able to grow an
+/// unbounded `String` in the reader loop — a newline-less flood would OOM
+/// the miner. Any line longer than this (no newline within the cap) is a
+/// transport error: the session disconnects, takes a strike, reconnects.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// How long a submit waits for transport confirmation before the connection
 /// is considered lost.
 pub const SUBMIT_ACK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -79,6 +86,71 @@ pub fn send_message(stream: &mut TcpStream, value: &Value) -> Result<(), String>
 /// worker id sends the bare wallet — some pools (e.g. snipanet) parse the
 /// whole field as an address and reject any suffix, even a trailing
 /// separator.
+/// Read one `\n`-terminated line into `line`, consuming at most `cap` bytes.
+///
+/// The bounded replacement for `BufRead::read_line`: a pool sending an
+/// unterminated flood can no longer grow the buffer without limit — past
+/// `cap` (without a newline) this returns a transport error and the caller
+/// drops the connection. The buffer is cleared before reading, so a failed
+/// call cannot leak a partial line into a later one. Cancel-safe: only
+/// bytes through the newline (or the cap) are consumed, matching what gets
+/// buffered into `line`.
+pub fn read_line_capped<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    cap: usize,
+) -> std::io::Result<usize> {
+    line.clear();
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(buf) => buf,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if available.is_empty() {
+            break; // EOF
+        }
+        match memchr(available, b'\n') {
+            Some(nl) => {
+                buf.extend_from_slice(&available[..=nl]);
+                reader.consume(nl + 1);
+                break;
+            }
+            None => {
+                let consumed = available.len();
+                buf.extend_from_slice(available);
+                reader.consume(consumed);
+                if buf.len() > cap {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("stratum line exceeds {cap}-byte cap"),
+                    ));
+                }
+            }
+        }
+    }
+    if buf.len() > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("stratum line exceeds {cap}-byte cap"),
+        ));
+    }
+    if buf.is_empty() {
+        return Ok(0);
+    }
+    // Match BufRead::read_line semantics: invalid UTF-8 is a transport error.
+    let text = std::str::from_utf8(&buf)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    line.push_str(text);
+    Ok(buf.len())
+}
+
+/// First index of `needle` in `buf`, if present (tiny stdlib-only memchr).
+fn memchr(buf: &[u8], needle: u8) -> Option<usize> {
+    buf.iter().position(|&b| b == needle)
+}
+
 pub fn login_string(wallet: &str, worker_id: &str, separator: &str) -> String {
     if worker_id.is_empty() {
         wallet.to_string()
@@ -121,8 +193,7 @@ pub fn login(
     let deadline = Instant::now() + LOGIN_TIMEOUT;
     loop {
         let mut line = String::new();
-        let n = reader
-            .read_line(&mut line)
+        let n = read_line_capped(reader, &mut line, MAX_LINE_BYTES)
             .map_err(|e| format!("read login reply: {e}"))?;
         if n == 0 {
             return Err("connection closed during login".to_string());
@@ -507,9 +578,10 @@ pub fn run_reader_loop<J: Clone>(
         }
 
         // Wait for the next line (with a short timeout slice so keepalives
-        // and shutdown stay responsive).
+        // and shutdown stay responsive). Capped: a newline-less flood from a
+        // broken/malicious pool errors out instead of growing the buffer.
         let mut line = String::new();
-        match reader.read_line(&mut line) {
+        match read_line_capped(reader, &mut line, MAX_LINE_BYTES) {
             Ok(0) => return Err("connection closed by pool".to_string()),
             Ok(_) => {}
             Err(ref e)
@@ -841,5 +913,78 @@ mod tests {
         let result = handle.join().unwrap();
         shutdown.store(true, Ordering::Relaxed);
         assert!(result.is_err(), "closed connection must end the loop");
+    }
+
+    #[test]
+    fn read_line_capped_delivers_lines_and_eof() {
+        let mut data = std::io::Cursor::new(b"{\"a\":1}\n{\"b\":2}\ntrailing".to_vec());
+        let mut line = String::new();
+        assert_eq!(read_line_capped(&mut data, &mut line, 1024).unwrap(), 8);
+        assert_eq!(line, "{\"a\":1}\n");
+        assert_eq!(read_line_capped(&mut data, &mut line, 1024).unwrap(), 8);
+        assert_eq!(line, "{\"b\":2}\n");
+        let n = read_line_capped(&mut data, &mut line, 1024).unwrap();
+        assert_eq!(line, "trailing"); // partial tail without newline (EOF)
+        assert_eq!(n, 8);
+        assert_eq!(read_line_capped(&mut data, &mut line, 1024).unwrap(), 0);
+        assert!(line.is_empty());
+    }
+
+    #[test]
+    fn read_line_capped_errors_past_cap_without_newline() {
+        let mut data = std::io::Cursor::new(vec![b'x'; 4096]);
+        let mut line = String::new();
+        let err = read_line_capped(&mut data, &mut line, 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_line_capped_accepts_line_at_exact_cap() {
+        let mut data = std::io::Cursor::new(vec![b'x'; 1023].to_vec());
+        data.get_mut().push(b'\n');
+        let mut line = String::new();
+        read_line_capped(&mut data, &mut line, 1024).unwrap();
+        assert_eq!(line.len(), 1024); // 1023 x's + newline (read_line semantics)
+    }
+
+    #[test]
+    fn read_line_capped_rejects_invalid_utf8() {
+        let mut data = std::io::Cursor::new(vec![0xFF, b'\n']);
+        let mut line = String::new();
+        let err = read_line_capped(&mut data, &mut line, 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn login_handshake_flood_is_rejected() {
+        // Live TCP: a pool that floods bytes with no newline (no framing) must
+        // terminate the login with a transport error, not grow memory forever.
+        let ((client, mut reader), (server, _)) = socket_pair();
+        std::thread::spawn(move || {
+            // 64 MB so the server blocks in write before finishing (a 2 MB
+            // flood fits in loopback socket buffers, and closing with the
+            // client's login request unread sends RST — the race we test past).
+            std::io::Write::write_all(&mut &server, &vec![b'x'; 64 * 1024 * 1024]).ok();
+        });
+        let mut stream = client;
+        let err = login(&mut reader, &mut stream, "w", "p", "test/1.0");
+        assert!(err.is_err(), "flood must abort login");
+        let msg = err.unwrap_err();
+        assert!(
+            msg.contains("cap") || msg.contains("closed"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn oversized_session_line_disconnects() {
+        let ((client, mut reader), (server, _)) = socket_pair();
+        std::thread::spawn(move || {
+            std::io::Write::write_all(&mut &server, &vec![b'y'; 2 * 1024 * 1024]).ok();
+        });
+        drop(client);
+        let mut line = String::new();
+        let err = read_line_capped(&mut reader, &mut line, MAX_LINE_BYTES);
+        assert!(err.is_err(), "oversized session line must be an error");
     }
 }

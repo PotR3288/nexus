@@ -501,8 +501,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                 return Some(fb);
             }
         }
-        let mut cands = self.candidates.lock().unwrap();
+        // Lock order: pools→candidates (everywhere-else order; replace()
+        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
+        let mut cands = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
@@ -532,8 +534,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// same index when nothing else is available; the caller should back off
     /// before retrying it, since it is now on cooldown).
     pub fn fail_immediately(&self, index: usize) -> Option<usize> {
-        let mut cands = self.candidates.lock().unwrap();
+        // Lock order: pools→candidates (everywhere-else order; replace()
+        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
+        let mut cands = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
@@ -564,8 +568,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// accumulate, and the whole point of this method is to catch "serves
     /// work fine but cannot validate anything".
     pub fn report_share_rejection(&self, index: usize) -> Option<usize> {
-        let mut cands = self.candidates.lock().unwrap();
+        // Lock order: pools→candidates (everywhere-else order; replace()
+        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
+        let mut cands = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
@@ -1778,5 +1784,67 @@ mod tests {
         assert_eq!(pairs2.len(), 1);
         assert!(!pairs2[0].1, "disabled entry carries enabled=false");
         assert_eq!(pairs2[0].0, pairs[1].0, "same identity, different flag");
+    }
+
+    #[test]
+    fn concurrent_replace_and_fail_paths_do_not_deadlock() {
+        // Regression for the inverted lock order: replace() holds
+        // pools→candidates while the failure paths (report_failure /
+        // fail_immediately / report_share_rejection) previously locked
+        // candidates→pools. Under contention that deadlocked. Hammer both
+        // directions from separate threads; a watchdog panics on hang.
+        let pm = std::sync::Arc::new(chain(vec![
+            TestEntry::stratum("ws://a", "w1"),
+            TestEntry::stratum("ws://b", "w2"),
+            TestEntry::stratum("ws://c", "w3"),
+        ]));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut handles = Vec::new();
+
+        // Hot-reload style replace() churn.
+        let pm1 = pm.clone();
+        let stop1 = stop.clone();
+        handles.push(std::thread::spawn(move || {
+            while !stop1.load(Ordering::Relaxed) {
+                pm1.replace(vec![
+                    TestEntry::stratum("ws://a", "w1"),
+                    TestEntry::stratum("ws://b", "w2"),
+                ]);
+            }
+        }));
+
+        // Failure-accounting churn (the reverse-order side).
+        let pm2 = pm.clone();
+        drop(pm);
+        let stop2 = stop.clone();
+        handles.push(std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                let _ = pm2.report_failure(0);
+                let _ = pm2.report_share_rejection(1);
+                pm2.fail_immediately(2);
+                pm2.report_success(0);
+                pm2.clear_share_rejections(1);
+            }
+        }));
+
+        // Watchdog thread: if the churn threads deadlock (a lock never released),
+        // done is never set and this aborts the process — CI sees a failure
+        // instead of a silent hang.
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = done.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            if !watchdog_done.load(Ordering::Relaxed) {
+                eprintln!("DEADLOCK: concurrent replace/fail churn did not finish");
+                std::process::abort();
+            }
+        });
+        // Let both churn threads run for a bounded number of iterations.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        stop.store(true, Ordering::Relaxed);
+        for h in handles {
+            h.join().unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
     }
 }
