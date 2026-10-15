@@ -71,13 +71,34 @@ pub fn check_auth(headers: &[(String, String)], token: &str) -> Result<(), u16> 
         None => Err(401),
         Some(v) => {
             if let Some(bearer) = v.strip_prefix("Bearer ") {
-                if bearer == token {
+                // Constant-time compare: a plain `==` short-circuits on the
+                // first differing byte, leaking match length/prefix via
+                // timing. Loopback-only binding mitigates, but tokens also
+                // gate LAN-exposed deployments — don't hand attackers a
+                // timing oracle.
+                if constant_time_eq(bearer.as_bytes(), token.as_bytes()) {
                     return Ok(());
                 }
             }
             Err(403)
         }
     }
+}
+
+/// Length-independent byte comparison: always scans the full key, XOR-
+/// folding into a single accumulator. Not `subtle`-verified crypto, but it
+/// removes the dominant timing signal for a bearer-token equality check.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        // Length is not secret (request bytes are attacker-chosen anyway);
+        // still, burn comparable time to avoid a coarse length oracle.
+        let _ = a.iter().chain(b.iter()).fold(0u8, |acc, x| acc ^ x);
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 fn unauthorized(code: u16) -> (u16, Value) {
@@ -481,6 +502,34 @@ mod tests {
         assert_eq!(check_auth(&h_ok, "secret"), Ok(()));
         // No token configured → always allowed.
         assert_eq!(check_auth(&h_none, ""), Ok(()));
+        // Constant-time compare must still behave as an equality check.
+        let h_prefix = vec![("Authorization".to_string(), "Bearer secre".to_string())];
+        assert_eq!(
+            check_auth(&h_prefix, "secret"),
+            Err(403),
+            "prefix must not match"
+        );
+        let h_long = vec![("Authorization".to_string(), "Bearer secretX".to_string())];
+        assert_eq!(
+            check_auth(&h_long, "secret"),
+            Err(403),
+            "longer must not match"
+        );
+        let h_case = vec![("AUTHORIZATION".to_string(), "Bearer secret".to_string())];
+        assert_eq!(
+            check_auth(&h_case, "secret"),
+            Ok(()),
+            "header name is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_is_plain_equality() {
+        assert!(super::constant_time_eq(b"", b""));
+        assert!(super::constant_time_eq(b"abc", b"abc"));
+        assert!(!super::constant_time_eq(b"abc", b"abd"));
+        assert!(!super::constant_time_eq(b"abc", b"ab"));
+        assert!(!super::constant_time_eq(b"ab", b"abc"));
     }
 
     #[test]
