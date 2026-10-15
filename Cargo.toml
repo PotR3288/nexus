@@ -1,6 +1,6 @@
 [package]
 name = "nexus"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.87"
 description = "Shared host infrastructure for xtminer and edgecase: config machinery, xmrig-compatible HTTP API core, config hot-reload watcher, notifications dispatcher, stratum framing."
