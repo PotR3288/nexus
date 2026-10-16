@@ -372,7 +372,8 @@ pub struct Event {
     /// Stable kind tag.
     pub kind: EventKind,
     /// Unix time (seconds) the event was recorded.
-    pub ts: u64,
+    #[serde(default, alias = "ts")]
+    pub timestamp: u64,
     /// Template/block height the event refers to, when the source reports
     /// one. `None` when unknown (e.g. stratum pools carry no height) —
     /// never 0.
@@ -404,7 +405,7 @@ impl Event {
     pub fn now(kind: EventKind) -> Self {
         Self {
             kind,
-            ts: SystemTime::now()
+            timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),

@@ -74,10 +74,54 @@ pub trait ApiHooks: Send + Sync {
     }
 }
 
+/// One parsed HTTP request, shared by the connection reader and
+/// [`route`] — grouped so the path/query/headers/body tuple can't be
+/// silently reshuffled at a call site.
+pub struct Request {
+    /// HTTP method (GET/PUT/POST).
+    pub method: String,
+    /// Full request URL including an optional `?query`.
+    pub url: String,
+    /// Header pairs as sent (case preserved; lookups are case-insensitive).
+    pub headers: Vec<(String, String)>,
+    /// Body bytes (Content-Length trimmed).
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    /// Path with any `?query` split off.
+    fn path(&self) -> &str {
+        match self.url.split_once('?') {
+            Some((p, _)) => p,
+            None => &self.url,
+        }
+    }
+}
+
+/// Why [`check_auth`] refused a request. Map to the HTTP status with
+/// [`AuthError::status_code`] — the numbers live here, not at call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthError {
+    /// No `Authorization` header at all → 401.
+    MissingHeader,
+    /// Header present but malformed or wrong → 403.
+    InvalidToken,
+}
+
+impl AuthError {
+    /// The HTTP status this failure answers with.
+    pub fn status_code(self) -> u16 {
+        match self {
+            AuthError::MissingHeader => 401,
+            AuthError::InvalidToken => 403,
+        }
+    }
+}
+
 /// xmrig's auth semantics (Httpd.cpp): a configured token is required —
 /// missing header → 401, malformed or wrong token → 403. With no token
 /// configured every request is allowed (the server binds loopback only).
-pub fn check_auth(headers: &[(String, String)], token: &str) -> Result<(), u16> {
+pub fn check_auth(headers: &[(String, String)], token: &str) -> Result<(), AuthError> {
     if token.is_empty() {
         return Ok(());
     }
@@ -86,7 +130,7 @@ pub fn check_auth(headers: &[(String, String)], token: &str) -> Result<(), u16> 
         .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
         .map(|(_, v)| v.clone());
     match value {
-        None => Err(401),
+        None => Err(AuthError::MissingHeader),
         Some(v) => {
             if let Some(bearer) = v.strip_prefix("Bearer ") {
                 // Constant-time compare: a plain `==` short-circuits on the
@@ -98,7 +142,7 @@ pub fn check_auth(headers: &[(String, String)], token: &str) -> Result<(), u16> 
                     return Ok(());
                 }
             }
-            Err(403)
+            Err(AuthError::InvalidToken)
         }
     }
 }
@@ -135,22 +179,16 @@ fn unauthorized(code: u16) -> (u16, Value) {
 /// 3. GET|PUT /1|2/config — own auth gate (PUT allowed before the 405 check).
 /// 4. Non-GET/PUT → 405 (before auth, matching xmrig).
 /// 5. GET → auth → summary/backends routes.
-pub fn route(
-    hooks: &dyn ApiHooks,
-    token: &str,
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: &[u8],
-) -> (u16, Value) {
-    let (path, query) = match url.split_once('?') {
-        Some((p, q)) => (p, q),
-        None => (url, ""),
-    };
+pub fn route(hooks: &dyn ApiHooks, token: &str, req: &Request) -> (u16, Value) {
+    let path = req.path();
+    let query = req.url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    let method = req.method.as_str();
+    let headers = req.headers.as_slice();
+    let body = req.body.as_slice();
 
     if method == "POST" && path == "/json_rpc" {
-        if let Err(code) = check_auth(headers, token) {
-            return unauthorized(code);
+        if let Err(e) = check_auth(headers, token) {
+            return unauthorized(e.status_code());
         }
         let m = serde_json::from_slice::<Value>(body)
             .ok()
@@ -160,22 +198,22 @@ pub fn route(
     }
 
     if method == "GET" && path == "/log" {
-        if let Err(code) = check_auth(headers, token) {
-            return unauthorized(code);
+        if let Err(e) = check_auth(headers, token) {
+            return unauthorized(e.status_code());
         }
         return hooks.log_tail(query);
     }
 
     if method == "GET" && path == "/1/events" {
-        if let Err(code) = check_auth(headers, token) {
-            return unauthorized(code);
+        if let Err(e) = check_auth(headers, token) {
+            return unauthorized(e.status_code());
         }
         return (200, hooks.events(query));
     }
 
     if matches!(path, "/1/config" | "/2/config") && matches!(method, "GET" | "PUT") {
-        if let Err(code) = check_auth(headers, token) {
-            return unauthorized(code);
+        if let Err(e) = check_auth(headers, token) {
+            return unauthorized(e.status_code());
         }
         if method == "GET" {
             return (200, hooks.config_json());
@@ -190,14 +228,15 @@ pub fn route(
         );
     }
 
-    if let Err(code) = check_auth(headers, token) {
-        return unauthorized(code);
+    if let Err(e) = check_auth(headers, token) {
+        return unauthorized(e.status_code());
     }
 
     match path {
         "/1/summary" | "/api.json" => (200, hooks.summary(1)),
         "/2/summary" => (200, hooks.summary(2)),
         "/2/backends" => (200, hooks.backends()),
+
         _ => (404, json!({"error": {"code": 404, "message": "Not found"}})),
     }
 }
@@ -244,9 +283,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// in the same TCP segment as the headers would never satisfy an
 /// ends-with check and would hang until the read timeout (live-verified:
 /// GETs answered in ~4 ms while POST /json_rpc stalled 10 s and closed).
-fn read_request(
-    stream: &mut TcpStream,
-) -> Option<(String, String, Vec<(String, String)>, Vec<u8>)> {
+fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     let mut chunk = [0u8; 4096];
     let header_end = loop {
@@ -299,7 +336,12 @@ fn read_request(
         body.truncate(content_length);
     }
 
-    Some((method, url, headers, body))
+    Some(Request {
+        method,
+        url,
+        headers,
+        body,
+    })
 }
 
 /// Serve until the process exits, on a dedicated std thread — the mining loop
@@ -345,12 +387,11 @@ pub fn spawn_server(
                                 if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err() {
                                     return;
                                 }
-                                let (method, url, headers, body) = match read_request(&mut stream) {
+                                let request = match read_request(&mut stream) {
                                     Some(req) => req,
                                     None => return, // timeout or malformed — close
                                 };
-                                let (status, payload) =
-                                    route(hooks.as_ref(), &token, &method, &url, &headers, &body);
+                                let (status, payload) = route(hooks.as_ref(), &token, &request);
                                 write_response(&mut stream, status, &payload.to_string());
                             })
                             .ok();
@@ -504,12 +545,29 @@ mod tests {
         }
     }
 
+    /// Test request builder: route's Request argument, assembled in the
+    /// shape the HTTP reader would produce.
+    fn req(method: &str, url: &str, headers: &[(String, String)], body: &[u8]) -> Request {
+        Request {
+            method: method.to_string(),
+            url: url.to_string(),
+            headers: headers.to_vec(),
+            body: body.to_vec(),
+        }
+    }
+
     #[test]
     fn auth_missing_token_is_401_wrong_is_403() {
         let h_none: Vec<(String, String)> = vec![];
-        assert_eq!(check_auth(&h_none, "secret"), Err(401));
+        assert_eq!(
+            check_auth(&h_none, "secret"),
+            Err(super::AuthError::MissingHeader)
+        );
         let h_bad = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        assert_eq!(check_auth(&h_bad, "secret"), Err(403));
+        assert_eq!(
+            check_auth(&h_bad, "secret"),
+            Err(super::AuthError::InvalidToken)
+        );
         let h_ok = vec![("Authorization".to_string(), "Bearer secret".to_string())];
         assert_eq!(check_auth(&h_ok, "secret"), Ok(()));
         // No token configured → always allowed.
@@ -518,13 +576,13 @@ mod tests {
         let h_prefix = vec![("Authorization".to_string(), "Bearer secre".to_string())];
         assert_eq!(
             check_auth(&h_prefix, "secret"),
-            Err(403),
+            Err(super::AuthError::InvalidToken),
             "prefix must not match"
         );
         let h_long = vec![("Authorization".to_string(), "Bearer secretX".to_string())];
         assert_eq!(
             check_auth(&h_long, "secret"),
-            Err(403),
+            Err(super::AuthError::InvalidToken),
             "longer must not match"
         );
         let h_case = vec![("AUTHORIZATION".to_string(), "Bearer secret".to_string())];
@@ -549,24 +607,24 @@ mod tests {
         let h = TestHooks::new();
         let empty: Vec<(String, String)> = vec![];
 
-        let (st, v) = route(&h, "", "GET", "/2/summary", &empty, b"");
+        let (st, v) = route(&h, "", &req("GET", "/2/summary", &empty, b""));
         assert_eq!(st, 200);
         assert_eq!(v["algo"], "test");
 
-        let (st, _) = route(&h, "", "GET", "/1/summary", &empty, b"");
+        let (st, _) = route(&h, "", &req("GET", "/1/summary", &empty, b""));
         assert_eq!(st, 200);
 
-        let (st, _) = route(&h, "", "GET", "/api.json", &empty, b"");
+        let (st, _) = route(&h, "", &req("GET", "/api.json", &empty, b""));
         assert_eq!(st, 200);
 
-        let (st, v) = route(&h, "", "GET", "/2/backends", &empty, b"");
+        let (st, v) = route(&h, "", &req("GET", "/2/backends", &empty, b""));
         assert_eq!(st, 200);
         assert!(v.is_array());
 
-        let (st, _) = route(&h, "", "GET", "/nope", &empty, b"");
+        let (st, _) = route(&h, "", &req("GET", "/nope", &empty, b""));
         assert_eq!(st, 404);
 
-        let (st, _) = route(&h, "", "DELETE", "/2/summary", &empty, b"");
+        let (st, _) = route(&h, "", &req("DELETE", "/2/summary", &empty, b""));
         assert_eq!(st, 405);
     }
 
@@ -575,16 +633,16 @@ mod tests {
         let h = TestHooks::new();
 
         // GET works without auth when no token configured.
-        let (st, v) = route(&h, "", "GET", "/2/config", &[], b"");
+        let (st, v) = route(&h, "", &req("GET", "/2/config", &[], b""));
         assert_eq!(st, 200);
         assert_eq!(v["masked"], true);
 
         // Auth gates the config routes.
-        let (st, _) = route(&h, "secret", "GET", "/2/config", &[], b"");
+        let (st, _) = route(&h, "secret", &req("GET", "/2/config", &[], b""));
         assert_eq!(st, 401);
 
         // PUT routes to the miner's put_config.
-        let (st, v) = route(&h, "", "PUT", "/1/config", &[], b"[x]\n");
+        let (st, v) = route(&h, "", &req("PUT", "/1/config", &[], b"[x]\n"));
         assert_eq!(st, 200);
         assert_eq!(v["status"], "OK");
     }
@@ -595,10 +653,12 @@ mod tests {
         let (st, v) = route(
             &h,
             "",
-            "POST",
-            "/json_rpc",
-            &[],
-            br#"{"jsonrpc":"2.0","method":"pause","id":1}"#,
+            &req(
+                "POST",
+                "/json_rpc",
+                &[],
+                br#"{"jsonrpc":"2.0","method":"pause","id":1}"#,
+            ),
         );
         assert_eq!(st, 200);
         assert_eq!(v["result"]["status"], "OK");
@@ -606,19 +666,19 @@ mod tests {
 
         // Unparseable body → empty method → miner's json_rpc decides the
         // error; route always answers 200 with the miner's payload.
-        let (st, _) = route(&h, "", "POST", "/json_rpc", &[], b"not json");
+        let (st, _) = route(&h, "", &req("POST", "/json_rpc", &[], b"not json"));
         assert_eq!(st, 200);
     }
 
     #[test]
     fn log_route_gated_by_auth() {
         let h = TestHooks::new();
-        let (st, _) = route(&h, "secret", "GET", "/log?lines=50", &[], b"");
+        let (st, _) = route(&h, "secret", &req("GET", "/log?lines=50", &[], b""));
         assert_eq!(st, 401);
         let h_bad = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        let (st, _) = route(&h, "secret", "GET", "/log?lines=50", &h_bad, b"");
+        let (st, _) = route(&h, "secret", &req("GET", "/log?lines=50", &h_bad, b""));
         assert_eq!(st, 403);
-        let (st, _) = route(&h, "", "GET", "/log?lines=50", &[], b"");
+        let (st, _) = route(&h, "", &req("GET", "/log?lines=50", &[], b""));
         assert_eq!(st, 200);
     }
 
@@ -626,17 +686,17 @@ mod tests {
     fn events_route_gated_by_auth_and_defaults_to_empty() {
         let h = TestHooks::new();
         // Auth gates the feed.
-        let (st, _) = route(&h, "secret", "GET", "/1/events", &[], b"");
+        let (st, _) = route(&h, "secret", &req("GET", "/1/events", &[], b""));
         assert_eq!(st, 401);
         let h_bad = vec![("Authorization".to_string(), "Bearer wrong".to_string())];
-        let (st, _) = route(&h, "secret", "GET", "/1/events", &h_bad, b"");
+        let (st, _) = route(&h, "secret", &req("GET", "/1/events", &h_bad, b""));
         assert_eq!(st, 403);
         // Default hook answers 200 with an empty array (uniform polling).
-        let (st, v) = route(&h, "", "GET", "/1/events?limit=5", &[], b"");
+        let (st, v) = route(&h, "", &req("GET", "/1/events?limit=5", &[], b""));
         assert_eq!(st, 200);
         assert_eq!(v, json!([]));
         // POST → 405 (gated before auth, same as /log).
-        let (st, _) = route(&h, "", "POST", "/1/events", &[], b"");
+        let (st, _) = route(&h, "", &req("POST", "/1/events", &[], b""));
         assert_eq!(st, 405);
     }
 

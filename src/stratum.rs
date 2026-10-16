@@ -410,46 +410,19 @@ impl<J: Send + Clone + 'static> Session<J> {
         let write_half = stream
             .try_clone()
             .map_err(|e| format!("clone write half: {e}"))?;
-        let mut write_half = write_half;
-        let mut reader = reader;
-        let session_id_reader = session_id.clone();
-        let job_slot_reader = Arc::clone(&job_slot);
-        let hooks = Arc::new(hooks);
-        let hooks_reader = Arc::clone(&hooks);
-        let shutdown_reader = Arc::clone(&reader_shutdown);
-        let shares_good_reader = Arc::clone(&shares_good);
-        let shares_bad_reader = Arc::clone(&shares_bad);
         // The reader thread keeps draining submits until shutdown; drop the
         // join handle — its lifetime is bounded by shutdown().
-        let _reader_thread = std::thread::Builder::new()
-            .name("stratum-reader".to_string())
-            .spawn(move || {
-                let mut submit_rx = submit_rx;
-                let result: Result<(), String> = run_reader_loop(
-                    &mut reader,
-                    &mut write_half,
-                    &session_id_reader,
-                    &job_slot_reader,
-                    &shares_good_reader,
-                    &shares_bad_reader,
-                    hooks_reader.as_ref(),
-                    nonce_width,
-                    &mut submit_rx,
-                    &shutdown_reader,
-                    KEEPALIVE_INTERVAL,
-                );
-                result?;
-                // Loop ended cleanly (shutdown flag). Drain queued submits so
-                // any pending ack fails fast instead of waiting out the
-                // caller's ack timeout on a session that is going away.
-                while let Ok(msg) = submit_rx.try_recv() {
-                    if let Some(ack) = msg.ack {
-                        let _ = ack.send(Err("connection closed".to_string()));
-                    }
-                }
-                Ok::<(), String>(())
-            })
-            .map_err(|e| format!("failed to spawn stratum reader thread: {e}"))?;
+        let reader_ctx = ReaderLoopCtx {
+            session_id: session_id.clone(),
+            job_slot: Arc::clone(&job_slot),
+            shares_good: Arc::clone(&shares_good),
+            shares_bad: Arc::clone(&shares_bad),
+            hooks,
+            nonce_width,
+            reader_shutdown: Arc::clone(&reader_shutdown),
+            keepalive_interval: KEEPALIVE_INTERVAL,
+        };
+        let _reader_thread = spawn_reader_thread(reader_ctx, reader, write_half, submit_rx);
 
         // `stream` drops at scope end — the reader thread holds its own
         // clones, so the connection stays open. Do NOT call
@@ -524,6 +497,51 @@ impl<J: Send + Clone + 'static> Session<J> {
     }
 }
 
+/// Session-wide handles the reader loop shares with the mining side —
+/// grouped so eight positional args (several same-typed Arcs) stop
+/// compiling silently when a caller swaps two of them. Owned values, so
+/// the struct moves into the reader thread as a whole.
+struct ReaderLoopCtx<J: Clone> {
+    session_id: String,
+    job_slot: Arc<Mutex<Option<J>>>,
+    shares_good: Arc<AtomicU64>,
+    shares_bad: Arc<AtomicU64>,
+    hooks: ReaderHooks<J>,
+    nonce_width: u8,
+    reader_shutdown: Arc<AtomicBool>,
+    keepalive_interval: Duration,
+}
+
+/// Spawn the reader loop on its own thread and return its handle. The
+/// caller drops the handle — the thread's lifetime is bounded by
+/// `ctx.reader_shutdown`; on clean loop exit, queued submit acks fail fast.
+fn spawn_reader_thread<J: Clone + Send + 'static>(
+    ctx: ReaderLoopCtx<J>,
+    reader: BufReader<TcpStream>,
+    write_half: TcpStream,
+    submit_rx: std::sync::mpsc::Receiver<SubmitMsg>,
+) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
+    std::thread::Builder::new()
+        .name("stratum-reader".to_string())
+        .spawn(move || {
+            let mut reader = reader;
+            let mut write_half = write_half;
+            let mut submit_rx = submit_rx;
+            let result = run_reader_loop(&ctx, &mut reader, &mut write_half, &mut submit_rx);
+            // Loop ended (cleanly on shutdown, or with the connection-failure
+            // reason). Drain queued submits so any pending ack fails fast
+            // instead of waiting out the caller's ack timeout on a session
+            // that is going away.
+            while let Ok(msg) = submit_rx.try_recv() {
+                if let Some(ack) = msg.ack {
+                    let _ = ack.send(Err("connection closed".to_string()));
+                }
+            }
+            result
+        })
+        .map_err(|e| format!("failed to spawn stratum reader thread: {e}"))
+}
+
 /// The reader loop: parse pushes, answer submits, send keepalives.
 /// Returns Err with the connection-failure reason. Share accounting is
 /// id-correlated (xmrig-style): only replies matching a queued submit id
@@ -531,19 +549,11 @@ impl<J: Send + Clone + 'static> Session<J> {
 /// never counted, and a pool that answers keepalive with "unknown method"
 /// (LuckyPool, snipanet) has keepalives disabled after the first such reply
 /// instead of polluting share stats.
-#[allow(clippy::too_many_arguments)]
-pub fn run_reader_loop<J: Clone>(
+fn run_reader_loop<J: Clone>(
+    ctx: &ReaderLoopCtx<J>,
     reader: &mut BufReader<TcpStream>,
     write_half: &mut TcpStream,
-    session_id: &str,
-    job_slot: &Arc<Mutex<Option<J>>>,
-    shares_good: &Arc<AtomicU64>,
-    shares_bad: &Arc<AtomicU64>,
-    hooks: &ReaderHooks<J>,
-    nonce_width: u8,
     submit_rx: &mut std::sync::mpsc::Receiver<SubmitMsg>,
-    reader_shutdown: &Arc<AtomicBool>,
-    keepalive_interval: Duration,
 ) -> Result<(), String> {
     // The keepalive cadence only advances when reads return; without a read
     // timeout a silent pool would block read_line forever and no keepalive
@@ -560,17 +570,17 @@ pub fn run_reader_loop<J: Clone>(
     let mut next_submit_id: u64 = FIRST_SUBMIT_ID;
     let mut keepalive_disabled = false;
     loop {
-        if reader_shutdown.load(Ordering::Relaxed) {
+        if ctx.reader_shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
 
         // Periodic keepalive — pools drop silent miners.
-        if !keepalive_disabled && last_keepalive.elapsed() >= keepalive_interval {
+        if !keepalive_disabled && last_keepalive.elapsed() >= ctx.keepalive_interval {
             let ka = json!({
                 "jsonrpc": "2.0",
                 "id": KEEPALIVE_REQUEST_ID,
                 "method": "keepalive",
-                "params": {"id": session_id}
+                "params": {"id": ctx.session_id}
             });
             send_message(write_half, &ka)?;
             debug!("Stratum keepalive sent");
@@ -619,12 +629,12 @@ pub fn run_reader_loop<J: Clone>(
             match method {
                 "job" => {
                     let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                    match (hooks.parse)(&params, nonce_width) {
+                    match (ctx.hooks.parse)(&params, ctx.nonce_width) {
                         Ok(job) => {
-                            *job_slot.lock().unwrap() = Some(job.clone());
+                            *ctx.job_slot.lock().unwrap() = Some(job.clone());
                             // Wake the mining window so fresh work is picked
                             // up immediately (no stale hashing).
-                            (hooks.on_job_installed)(&job);
+                            (ctx.hooks.on_job_installed)(&job);
                         }
                         Err(e) => warn!("Malformed job push skipped: {e}"),
                     }
@@ -651,10 +661,10 @@ pub fn run_reader_loop<J: Clone>(
             };
             if is_submit_reply {
                 info!("Share rejected: {text}");
-                shares_bad.fetch_add(1, Ordering::Relaxed);
-                (hooks.on_share_rejected)(&text);
+                ctx.shares_bad.fetch_add(1, Ordering::Relaxed);
+                (ctx.hooks.on_share_rejected)(&text);
             } else {
-                (hooks.on_nonsubmit_error)(&text);
+                (ctx.hooks.on_nonsubmit_error)(&text);
                 let unknown_method = text.to_ascii_lowercase().contains("unknown method");
                 if unknown_method && !keepalive_disabled {
                     info!("Pool does not support keepalive — disabling it (errors were not share rejections)");
@@ -665,8 +675,8 @@ pub fn run_reader_loop<J: Clone>(
         }
         if is_submit_reply {
             debug!("Share accepted: {msg}");
-            shares_good.fetch_add(1, Ordering::Relaxed);
-            (hooks.on_share_accepted)();
+            ctx.shares_good.fetch_add(1, Ordering::Relaxed);
+            (ctx.hooks.on_share_accepted)();
         } else {
             debug!("Stratum response: {msg}");
         }
@@ -833,19 +843,17 @@ mod tests {
             let (tx, rx) = std::sync::mpsc::channel::<SubmitMsg>();
             let handle = std::thread::spawn(move || {
                 let mut rx = rx;
-                run_reader_loop(
-                    &mut c_reader,
-                    &mut c_stream,
-                    "sess-1",
-                    &job_slot_c,
-                    &shares_good,
-                    &shares_bad,
-                    &hooks,
-                    64,
-                    &mut rx,
-                    &shutdown_c,
-                    Duration::from_millis(150), // fast keepalive for the test
-                )
+                let ctx = ReaderLoopCtx {
+                    session_id: "sess-1".to_string(),
+                    job_slot: job_slot_c,
+                    shares_good,
+                    shares_bad,
+                    hooks,
+                    nonce_width: 64,
+                    reader_shutdown: shutdown_c,
+                    keepalive_interval: Duration::from_millis(150), // fast keepalive for the test
+                };
+                run_reader_loop(&ctx, &mut c_reader, &mut c_stream, &mut rx)
             });
             (handle, shutdown, tx, job_slot)
         };
