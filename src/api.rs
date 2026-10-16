@@ -29,6 +29,22 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Header-section cap for one request: past this without a complete
+/// "\r\n\r\n" delimiter, the request is malformed (an unbounded header
+/// flood must not grow the buffer).
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// Body cap (Content-Length is clamped to this) — json_rpc PUT/POST bodies
+/// are small config documents.
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Per-request read timeout: covers a slow dashboard poll; payloads are
+/// small and served from memory.
+pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after an accept error before re-entering the accept loop.
+pub const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+/// Delay before a scheduled restart so the JSON-RPC response reaches the
+/// client before the process image is replaced.
+pub const RESTART_RESPONSE_DELAY: Duration = Duration::from_millis(250);
+
 /// The miner-specific half of the API. All methods return ready JSON —
 /// rendering stays in the miner where the units and types live.
 pub trait ApiHooks: Send + Sync {
@@ -237,7 +253,7 @@ fn read_request(
         if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4; // first byte AFTER the delimiter
         }
-        if buf.len() > 64 * 1024 {
+        if buf.len() > MAX_HEADER_BYTES {
             return None;
         }
         let n = stream.read(&mut chunk).ok()?;
@@ -269,7 +285,7 @@ fn read_request(
         .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
         .and_then(|(_, v)| v.parse::<usize>().ok())
         .unwrap_or(0)
-        .min(1 << 20);
+        .min(MAX_BODY_BYTES);
     let mut body: Vec<u8> = buf[header_end..].to_vec();
     if content_length > body.len() {
         let missing = content_length - body.len();
@@ -326,12 +342,7 @@ pub fn spawn_server(
                         std::thread::Builder::new()
                             .name("api-conn".to_string())
                             .spawn(move || {
-                                // 10 s covers a slow dashboard poll; payloads
-                                // are small and served from memory.
-                                if stream
-                                    .set_read_timeout(Some(Duration::from_secs(10)))
-                                    .is_err()
-                                {
+                                if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err() {
                                     return;
                                 }
                                 let (method, url, headers, body) = match read_request(&mut stream) {
@@ -346,7 +357,7 @@ pub fn spawn_server(
                     }
                     Err(e) => {
                         log::warn!("API accept error: {e}");
-                        std::thread::sleep(Duration::from_millis(100));
+                        std::thread::sleep(ACCEPT_ERROR_BACKOFF);
                     }
                 }
             })
@@ -372,8 +383,7 @@ pub fn schedule_restart_with_failure_prefix(failure_prefix: &str) {
     std::thread::Builder::new()
         .name("api-restart".to_string())
         .spawn(move || {
-            // Give the HTTP response time to reach the client.
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(RESTART_RESPONSE_DELAY);
             #[cfg(unix)]
             {
                 use std::ffi::CString;

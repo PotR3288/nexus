@@ -110,7 +110,10 @@ pub trait WorkSourceEntry: Clone + Send + Sync + 'static {
     fn work_source(&self) -> WorkSource;
     /// Login-relevant identity: URL plus every field that changes what we
     /// log in with. Two entries with equal identities are the same pool for
-    /// selection-watching purposes.
+    /// selection-watching purposes. Contract: the URL comes FIRST,
+    /// terminated by a NUL (`"{url}\u{0}..."`) — the selection watcher
+    /// distinguishes a source switch from a login-key edit by extracting
+    /// that URL prefix (see [`identity_url`]).
     fn identity(&self) -> String;
     /// Full fingerprint modulo `enabled` — the hot-reload carryover key.
     fn reload_key(&self) -> String;
@@ -148,6 +151,18 @@ pub const REVERT_COOLDOWN: Duration = Duration::from_secs(300);
 /// after a reorg) are normal; only a sustained streak means the source cannot
 /// validate anything right now.
 pub const REJECT_THRESHOLD: u32 = 5;
+/// Poll interval of the selection watcher ([`spawn_selection_watcher`]):
+/// how often job-entry identity is compared against the current selection.
+pub const SELECTION_WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The URL prefix of a [`WorkSourceEntry::identity`] string: everything
+/// before the first NUL. Identities are contractually `"{url}\u{0}..."`
+/// (see the trait doc); a NUL-less identity is treated as its own URL so
+/// simple url-only identities keep working.
+fn identity_url(identity: &str) -> &str {
+    identity.split('\u{0}').next().unwrap_or(identity)
+}
+
 /// Cooldown for an entry banned by share rejections — longer than
 /// [`RETRY_AFTER`]: the ban persists (the rejection streak is NOT reset), so
 /// when this cooldown expires and selection probes the entry again, ONE
@@ -229,10 +244,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// an empty manager — [`select`](Self::select) returns `None` and the
     /// caller idles until a hot-reload adds an enabled entry.
     pub fn new(pools: Vec<E>) -> Self {
-        let n = pools.len();
+        let pool_count = pools.len();
         info!(
             "Pool failover: {} candidate(s), {} enabled — {}",
-            n,
+            pool_count,
             pools.iter().filter(|p| p.enabled()).count(),
             pools
                 .iter()
@@ -301,14 +316,14 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         let prev_verified: HashSet<String> = {
             // Lock order pools → candidates, as everywhere else.
             let old_pools = self.pools.lock().unwrap();
-            let cands = self.candidates.lock().unwrap();
+            let candidates = self.candidates.lock().unwrap();
             pools
                 .iter()
                 .filter(|p| {
                     old_pools
                         .iter()
                         .position(|q| q.reload_key() == p.reload_key())
-                        .map(|i| cands[i].was_verified)
+                        .map(|i| candidates[i].was_verified)
                         .unwrap_or(false)
                 })
                 .map(|p| p.url().to_string())
@@ -359,11 +374,11 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// serving from), then the highest-priority verified one.
     pub fn last_verified_index(&self) -> Option<usize> {
         let pools = self.pools.lock().unwrap();
-        let cands = self.candidates.lock().unwrap();
+        let candidates = self.candidates.lock().unwrap();
         let active = self.active.load(Ordering::Relaxed);
         if active != usize::MAX {
             if let Some(p) = pools.get(active) {
-                if p.enabled() && cands[active].was_verified {
+                if p.enabled() && candidates[active].was_verified {
                     return Some(active);
                 }
             }
@@ -371,7 +386,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         pools
             .iter()
             .enumerate()
-            .find(|(i, p)| p.enabled() && cands[*i].was_verified)
+            .find(|(i, p)| p.enabled() && candidates[*i].was_verified)
             .map(|(i, _)| i)
     }
 
@@ -389,13 +404,13 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         if let Some(p) = pools.get(index) {
             // An entry that was on cooldown is healthy again — say so once per
             // recovery (the counter reset below keeps this from repeating).
-            let cands = self.candidates.lock().unwrap();
-            if let Some(c) = cands.get(index) {
+            let candidates = self.candidates.lock().unwrap();
+            if let Some(c) = candidates.get(index) {
                 if c.consecutive_fails > 0 || c.retry_at_ms.load(Ordering::Relaxed) != 0 {
                     info!("Pool {} is healthy again", p.url());
                 }
             }
-            drop(cands);
+            drop(candidates);
             // "Currently serving" for display: the active selection and/or the
             // entry select() would return right now (covers the one-cycle lag
             // where an in-flight window still mines the previous entry). Lock
@@ -403,8 +418,8 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             // after both are released.
             let active_idx = self.active.load(Ordering::Relaxed);
             let selected_idx = {
-                let cands = self.candidates.lock().unwrap();
-                Self::select_locked(&pools, &cands, active_idx).map(|s| s.index)
+                let candidates = self.candidates.lock().unwrap();
+                Self::select_locked(&pools, &candidates, active_idx).map(|s| s.index)
             };
             if index == active_idx || Some(index) == selected_idx {
                 self.connected_urls
@@ -416,14 +431,57 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // Clear the failure/cooldown state; this entry has now PROVEN its
         // connection — it may be reverted to in future, and selection must
         // not keep skipping it as unproven.
-        let mut cands = self.candidates.lock().unwrap();
-        if let Some(c) = cands.get_mut(index) {
+        let mut candidates = self.candidates.lock().unwrap();
+        if let Some(c) = candidates.get_mut(index) {
             c.consecutive_fails = 0;
             c.retry_at_ms.store(0, Ordering::Relaxed);
             c.was_verified = true;
             c.reverted = false;
         }
         self.active.store(index, Ordering::Relaxed);
+    }
+
+    /// Revert the active selection to `fallback_index` — the live-pool-switch
+    /// recovery for a never-verified entry that failed while a previously
+    /// working one exists. Puts the failed entry on the extended cooldown,
+    /// drops it from the connected set, moves `active` to the fallback and
+    /// returns the fallback index for the caller to try next.
+    fn revert_to_verified(&self, index: usize, url: &str, fallback_index: usize) -> usize {
+        // The failed entry goes on an extended cooldown — long enough
+        // that selection keeps preferring the working fallback for a
+        // while (a short RETRY_AFTER would ping-pong: once it expires,
+        // select() re-prefers this highest-priority entry and the
+        // miner bounces dead→revert→dead every minute). The cooldown
+        // is NOT infinite so a recovered entry still gets picked up
+        // eventually (and a config reload resets all state
+        // immediately). If the user wants to force this entry back
+        // sooner they edit the config or disable the other entries.
+        {
+            let mut candidates = self.candidates.lock().unwrap();
+            candidates[index].retry_at_ms.store(
+                Self::now_ms() + REVERT_COOLDOWN.as_millis() as u64,
+                Ordering::Relaxed,
+            );
+            // Remember this entry was reverted from — selection must
+            // not hand it back even after the cooldown expires (that
+            // would ping-pong dead→revert→dead every cooldown). A
+            // success on it clears the flag; a config reload resets
+            // everything.
+            candidates[index].reverted = true;
+        }
+        // The failed entry is not currently serving — stop advertising it.
+        self.connected_urls.lock().unwrap().remove(url);
+        self.active.store(fallback_index, Ordering::Relaxed);
+        let fallback_url = {
+            let pools = self.pools.lock().unwrap();
+            pools[fallback_index].url().to_string()
+        };
+        console_error(&format!(
+            "Pool {} unreachable — reverting to the previously working pool {}",
+            url, fallback_url
+        ));
+        self.failovers.fetch_add(1, Ordering::Relaxed);
+        fallback_index
     }
 
     /// Record a work failure on the given entry index. Fails over when the
@@ -447,8 +505,12 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             let pools = self.pools.lock().unwrap();
             match pools.get(index) {
                 Some(p) => {
-                    let cands = self.candidates.lock().unwrap();
-                    (p.url().to_string(), p.enabled(), cands[index].was_verified)
+                    let candidates = self.candidates.lock().unwrap();
+                    (
+                        p.url().to_string(),
+                        p.enabled(),
+                        candidates[index].was_verified,
+                    )
                 }
                 None => return None,
             }
@@ -462,49 +524,14 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             // No verified entry exists at all (fresh start, nothing has ever
             // connected): the normal threshold applies — every candidate is
             // equally unproven and the chain simply walks through them.
-            if last.is_some() && last != Some(index) {
-                let fb = last.unwrap();
-                // The failed entry goes on an extended cooldown — long enough
-                // that selection keeps preferring the working fallback for a
-                // while (a short RETRY_AFTER would ping-pong: once it expires,
-                // select() re-prefers this highest-priority entry and the
-                // miner bounces dead→revert→dead every minute). The cooldown
-                // is NOT infinite so a recovered entry still gets picked up
-                // eventually (and a config reload resets all state
-                // immediately). If the user wants to force this entry back
-                // sooner they edit the config or disable the other entries.
-                {
-                    let mut cands = self.candidates.lock().unwrap();
-                    cands[index].retry_at_ms.store(
-                        Self::now_ms() + REVERT_COOLDOWN.as_millis() as u64,
-                        Ordering::Relaxed,
-                    );
-                    // Remember this entry was reverted from — selection must
-                    // not hand it back even after the cooldown expires (that
-                    // would ping-pong dead→revert→dead every cooldown). A
-                    // success on it clears the flag; a config reload resets
-                    // everything.
-                    cands[index].reverted = true;
-                }
-                // The failed entry is not currently serving — stop advertising it.
-                self.connected_urls.lock().unwrap().remove(&url);
-                self.active.store(fb, Ordering::Relaxed);
-                let (failed_url, fb_url) = {
-                    let pools = self.pools.lock().unwrap();
-                    (pools[index].url().to_string(), pools[fb].url().to_string())
-                };
-                console_error(&format!(
-                    "Pool {} unreachable — reverting to the previously working pool {}",
-                    failed_url, fb_url
-                ));
-                self.failovers.fetch_add(1, Ordering::Relaxed);
-                return Some(fb);
+            if let Some(fallback_index) = last.filter(|&i| i != index) {
+                return Some(self.revert_to_verified(index, &url, fallback_index));
             }
         }
         // Lock order: pools→candidates (everywhere-else order; replace()
         // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
-        let mut cands = self.candidates.lock().unwrap();
+        let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
@@ -514,13 +541,13 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // every blip. The entry is removed from the "currently serving" set
         // only when it is actually ABANDONED (threshold failover / revert in
         // `rotate`), or re-proven by a success.
-        cands[index].consecutive_fails += 1;
-        if cands[index].consecutive_fails < FAIL_THRESHOLD {
+        candidates[index].consecutive_fails += 1;
+        if candidates[index].consecutive_fails < FAIL_THRESHOLD {
             return Some(index); // retry the same entry
         }
         Self::rotate(
             &pools,
-            &mut cands,
+            &mut candidates,
             index,
             &self.failovers,
             &self.active,
@@ -537,13 +564,13 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // Lock order: pools→candidates (everywhere-else order; replace()
         // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
-        let mut cands = self.candidates.lock().unwrap();
+        let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
         Self::rotate(
             &pools,
-            &mut cands,
+            &mut candidates,
             index,
             &self.failovers,
             &self.active,
@@ -571,22 +598,22 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // Lock order: pools→candidates (everywhere-else order; replace()
         // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
-        let mut cands = self.candidates.lock().unwrap();
+        let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
             return None;
         }
-        cands[index].consecutive_rejects += 1;
-        if cands[index].consecutive_rejects < REJECT_THRESHOLD {
+        candidates[index].consecutive_rejects += 1;
+        if candidates[index].consecutive_rejects < REJECT_THRESHOLD {
             return Some(index); // keep mining here for now
         }
         console_error(&format!(
-            "Pool {} rejected {n} shares in a row — failing over",
+            "Pool {} rejected {streak} shares in a row — failing over",
             pools[index].url(),
-            n = cands[index].consecutive_rejects
+            streak = candidates[index].consecutive_rejects
         ));
         let next = Self::rotate(
             &pools,
-            &mut cands,
+            &mut candidates,
             index,
             &self.failovers,
             &self.active,
@@ -597,7 +624,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // again, one rejected submission re-bans it at once. RETRY_AFTER
         // would ping-pong dead→failover→dead every minute, each cycle losing
         // a share.
-        cands[index].retry_at_ms.store(
+        candidates[index].retry_at_ms.store(
             Self::now_ms() + REJECT_COOLDOWN.as_millis() as u64,
             Ordering::Relaxed,
         );
@@ -609,8 +636,8 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// validation path works again; sporadic rejections (stale jobs after a
     /// reorg, etc.) must not accumulate toward failover.
     pub fn clear_share_rejections(&self, index: usize) {
-        let mut cands = self.candidates.lock().unwrap();
-        if let Some(c) = cands.get_mut(index) {
+        let mut candidates = self.candidates.lock().unwrap();
+        if let Some(c) = candidates.get_mut(index) {
             c.consecutive_rejects = 0;
         }
     }
@@ -629,20 +656,19 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// `None` ("none") — honest: no proven connection exists yet.
     fn rotate(
         pools: &[E],
-        cands: &mut [Candidate],
+        candidates: &mut [Candidate],
         index: usize,
         failovers: &AtomicU64,
         active: &AtomicUsize,
         connected_urls: &Mutex<HashSet<String>>,
     ) -> Option<usize> {
-        let n = pools.len();
-        // Threshold hit — mark this entry on cooldown.
+        let pool_count = pools.len();
         let failed_url = pools[index].url().to_string();
-        cands[index].retry_at_ms.store(
+        candidates[index].retry_at_ms.store(
             Self::now_ms() + RETRY_AFTER.as_millis() as u64,
             Ordering::Relaxed,
         );
-        cands[index].consecutive_fails = 0;
+        candidates[index].consecutive_fails = 0;
         // NOTE: `consecutive_rejects` is deliberately NOT reset here. An entry
         // banned for share rejections keeps its streak at/above threshold:
         // when its cooldown expires and selection probes it again, ONE more
@@ -657,16 +683,15 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         connected_urls.lock().unwrap().remove(&failed_url);
         warn!("Pool {} failed — failing over", failed_url);
 
-        // Find the next ENABLED candidate not on cooldown (wraps around).
-        for step in 1..=n {
-            let next = (index + step) % n;
+        for step in 1..=pool_count {
+            let next = (index + step) % pool_count;
             if next == index {
                 break; // everything else is disabled or on cooldown
             }
             if !pools[next].enabled() {
                 continue;
             }
-            if cands[next].retry_at_ms.load(Ordering::Relaxed) <= Self::now_ms() {
+            if candidates[next].retry_at_ms.load(Ordering::Relaxed) <= Self::now_ms() {
                 failovers.fetch_add(1, Ordering::Relaxed);
                 info!(
                     "Failing over to pool {} ({} — priority {})",
@@ -705,10 +730,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // work, so nothing ever clears `reverted` (only a config reload did).
         {
             let requalified = {
-                let mut cands = self.candidates.lock().unwrap();
+                let mut candidates = self.candidates.lock().unwrap();
                 let now = Self::now_ms();
                 let mut out = Vec::new();
-                for (i, c) in cands.iter_mut().enumerate() {
+                for (i, c) in candidates.iter_mut().enumerate() {
                     let until = c.retry_at_ms.load(Ordering::Relaxed);
                     if c.reverted && until != 0 && until <= now {
                         c.reverted = false;
@@ -735,15 +760,15 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             }
         }
         let pools = self.pools.lock().unwrap();
-        let cands = self.candidates.lock().unwrap();
-        Self::select_locked(&pools, &cands, self.active.load(Ordering::Relaxed))
+        let candidates = self.candidates.lock().unwrap();
+        Self::select_locked(&pools, &candidates, self.active.load(Ordering::Relaxed))
     }
 
     /// Selection logic over already-locked state (lock order: `pools` then
     /// `candidates`, always — callers must hold both in that order). Shared
     /// by [`select`](Self::select) and the display-truthfulness check in
     /// [`report_success`](Self::report_success).
-    fn select_locked(pools: &[E], cands: &[Candidate], active: usize) -> Option<Selection<E>> {
+    fn select_locked(pools: &[E], candidates: &[Candidate], active: usize) -> Option<Selection<E>> {
         let now = Self::now_ms();
 
         // Prefer the highest-priority healthy enabled candidate. An entry that
@@ -757,10 +782,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             if !p.enabled() {
                 continue;
             }
-            if cands[i].retry_at_ms.load(Ordering::Relaxed) > now {
+            if candidates[i].retry_at_ms.load(Ordering::Relaxed) > now {
                 continue; // on cooldown
             }
-            if cands[i].reverted {
+            if candidates[i].reverted {
                 continue; // reverted from — not eligible until it proves itself
             }
             chosen = Some(i);
@@ -832,7 +857,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                             // re-select), but the operator needs to know
                             // whether this was a source switch or a login-key
                             // edit on the entry already in use.
-                            if sel.pool.url() == identity.split('\u{0}').next().unwrap_or("") {
+                            if sel.pool.url() == identity_url(&identity) {
                                 info!(
                                     "Pool login keys changed for {} — re-login with new credentials",
                                     sel.pool.url()
@@ -843,7 +868,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                         _ => selection_changed.store(true, Ordering::SeqCst),
                     }
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(SELECTION_WATCH_INTERVAL);
             })
             .expect("failed to spawn pool-selection watcher thread")
     }
@@ -946,7 +971,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct TestEntry {
         url: String,
-        ws: WorkSource,
+        source_kind: WorkSource,
         wallet: String,
         enabled: bool,
     }
@@ -955,7 +980,7 @@ mod tests {
         fn node(url: &str) -> Self {
             Self {
                 url: url.to_string(),
-                ws: WorkSource::Node,
+                source_kind: WorkSource::Node,
                 wallet: String::new(),
                 enabled: true,
             }
@@ -963,7 +988,7 @@ mod tests {
         fn stratum(url: &str, wallet: &str) -> Self {
             Self {
                 url: url.to_string(),
-                ws: WorkSource::Stratum,
+                source_kind: WorkSource::Stratum,
                 wallet: wallet.to_string(),
                 enabled: true,
             }
@@ -971,7 +996,7 @@ mod tests {
         fn stratum_disabled(url: &str, wallet: &str) -> Self {
             Self {
                 url: url.to_string(),
-                ws: WorkSource::Stratum,
+                source_kind: WorkSource::Stratum,
                 wallet: wallet.to_string(),
                 enabled: false,
             }
@@ -983,10 +1008,10 @@ mod tests {
             &self.url
         }
         fn work_source(&self) -> WorkSource {
-            self.ws
+            self.source_kind
         }
         fn identity(&self) -> String {
-            format!("{}\u{0}{}\u{0}{}", self.url, self.ws, self.wallet)
+            format!("{}\u{0}{}\u{0}{}", self.url, self.source_kind, self.wallet)
         }
         fn reload_key(&self) -> String {
             self.identity()
@@ -1026,77 +1051,77 @@ mod tests {
 
     #[test]
     fn single_pool_never_fails_over() {
-        let pm = chain(vec![TestEntry::node("http://a")]);
-        assert_eq!(pm.candidate_count(), 1);
+        let manager = chain(vec![TestEntry::node("http://a")]);
+        assert_eq!(manager.candidate_count(), 1);
         // Below threshold: same entry.
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(0));
         // Threshold hit: no other candidate → same entry again.
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.failover_count(), 0);
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.failover_count(), 0);
     }
 
     #[test]
     fn fails_over_after_threshold() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        assert_eq!(pm.candidate_count(), 2);
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(0));
+        assert_eq!(manager.candidate_count(), 2);
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(0));
         // Third consecutive failure trips the threshold.
-        assert_eq!(pm.report_failure(0), Some(1));
-        assert_eq!(pm.failover_count(), 1);
+        assert_eq!(manager.report_failure(0), Some(1));
+        assert_eq!(manager.failover_count(), 1);
         // select() now prefers the failed-over entry (a is on cooldown).
-        let sel = pm.select().unwrap();
+        let sel = manager.select().unwrap();
         assert_eq!(sel.index, 1);
         assert!(sel.failed_over);
     }
 
     #[test]
     fn success_resets_failure_count() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_failure(0);
-        pm.report_failure(0);
-        pm.report_success(0); // reset
-        assert_eq!(pm.report_failure(0), Some(0)); // fail count restarted
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(1)); // now it trips
+        manager.report_failure(0);
+        manager.report_failure(0);
+        manager.report_success(0); // reset
+        assert_eq!(manager.report_failure(0), Some(0)); // fail count restarted
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(1)); // now it trips
     }
 
     #[test]
     fn failover_wraps_and_skips_cooldown() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
             TestEntry::node("http://c"),
         ]);
         // Each entry takes FAIL_THRESHOLD consecutive failures to trip.
         for _ in 0..FAIL_THRESHOLD - 1 {
-            assert_eq!(pm.report_failure(0), Some(0));
+            assert_eq!(manager.report_failure(0), Some(0));
         }
         // a trips → b.
-        assert_eq!(pm.report_failure(0), Some(1));
+        assert_eq!(manager.report_failure(0), Some(1));
         for _ in 0..FAIL_THRESHOLD - 1 {
-            assert_eq!(pm.report_failure(1), Some(1));
+            assert_eq!(manager.report_failure(1), Some(1));
         }
         // b trips → c.
-        assert_eq!(pm.report_failure(1), Some(2));
+        assert_eq!(manager.report_failure(1), Some(2));
         for _ in 0..FAIL_THRESHOLD - 1 {
-            assert_eq!(pm.report_failure(2), Some(2));
+            assert_eq!(manager.report_failure(2), Some(2));
         }
         // c trips; a and b are on cooldown → stay on c.
-        assert_eq!(pm.report_failure(2), Some(2));
-        assert_eq!(pm.failover_count(), 2);
+        assert_eq!(manager.report_failure(2), Some(2));
+        assert_eq!(manager.failover_count(), 2);
     }
 
     #[test]
     fn disabled_pools_are_skipped_in_failover() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
             TestEntry::stratum("c:7038", "W"),
@@ -1108,13 +1133,13 @@ mod tests {
             TestEntry::stratum("c:7038", "W"),
         ];
         pools[1].enabled = false;
-        let _ = pm.replace(pools);
-        assert_eq!(pm.candidate_count(), 2);
+        let _ = manager.replace(pools);
+        assert_eq!(manager.candidate_count(), 2);
         // a trips → must skip disabled b and land on the stratum entry.
         for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(0);
+            manager.report_failure(0);
         }
-        let sel = pm.select().unwrap();
+        let sel = manager.select().unwrap();
         assert_eq!(sel.index, 2);
         assert_eq!(sel.pool.work_source(), WorkSource::Stratum);
     }
@@ -1123,63 +1148,63 @@ mod tests {
     fn cross_type_failover_node_to_stratum_and_back() {
         // A node chain that falls through to a stratum pool — the whole point
         // of one mixed failover list.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::stratum("xtm-rx:7038", "W"),
         ]);
         for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(0);
+            manager.report_failure(0);
         }
-        assert_eq!(pm.select().unwrap().index, 1); // on the stratum entry now
+        assert_eq!(manager.select().unwrap().index, 1); // on the stratum entry now
 
         // Simulate the node's cooldown expiring — selection returns to it.
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0].retry_at_ms.store(
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0].retry_at_ms.store(
                 PoolManager::<TestEntry>::now_ms().saturating_sub(1000),
                 Ordering::Relaxed,
             );
         }
-        assert_eq!(pm.select().unwrap().index, 0); // back to the node
+        assert_eq!(manager.select().unwrap().index, 0); // back to the node
 
         // And a stratum failure fails over BACK to the recovered node.
         for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(1);
+            manager.report_failure(1);
         }
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
     }
 
     #[test]
     fn replace_resets_state_and_reselects() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         // Trip a's cooldown.
         for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(0);
+            manager.report_failure(0);
         }
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.select().unwrap().index, 1);
         // Hot-reload with the same list: state resets → back to primary.
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
 
         // Disabling the primary live moves selection to the next entry.
         let mut pools = vec![TestEntry::node("http://a"), TestEntry::node("http://b")];
         pools[0].enabled = false;
-        let _ = pm.replace(pools);
-        assert_eq!(pm.select().unwrap().index, 1);
+        let _ = manager.replace(pools);
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // Disabling everything → no selection (caller idles).
         let mut pools = vec![TestEntry::node("http://a"), TestEntry::node("http://b")];
         for p in &mut pools {
             p.enabled = false;
         }
-        let _ = pm.replace(pools);
-        assert!(pm.select().is_none());
+        let _ = manager.replace(pools);
+        assert!(manager.select().is_none());
     }
 
     #[test]
@@ -1189,31 +1214,31 @@ mod tests {
         // that cannot be reached. Selection must revert to the previously
         // working entry at once — one strike, not three — and display must
         // never advertise the dead entry as active.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a is verified (the miner was working on it)
+        manager.report_success(0); // a is verified (the miner was working on it)
 
         // Hot-reload: new primary c (unreachable), old entry a demoted to #2.
         let mut pools = vec![TestEntry::node("http://c"), TestEntry::node("http://a")];
         for p in &mut pools {
             p.enabled = true;
         }
-        let _ = pm.replace(pools);
+        let _ = manager.replace(pools);
 
         // The hashrate line must NOT advertise c — it was never verified.
-        assert!(pm.active_pool().is_none());
+        assert!(manager.active_pool().is_none());
 
         // First failure on the unverified entry reverts to a immediately.
-        assert_eq!(pm.report_failure(0), Some(1));
+        assert_eq!(manager.report_failure(0), Some(1));
         // Selection now lands on the previously working entry.
-        let sel = pm.select().unwrap();
+        let sel = manager.select().unwrap();
         assert_eq!(sel.index, 1);
         assert_eq!(sel.pool.url(), "http://a");
         // Display is truthful again: a is verified and active.
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
     }
@@ -1227,24 +1252,24 @@ mod tests {
         // working fallback keeps being selected for the whole window; after
         // REVERT_COOLDOWN expires, the entry is re-qualified for ONE probe
         // per cooldown cycle (see reverted_pool_fails_back_after_cooldown_expiry).
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a working
+        manager.report_success(0); // a working
 
         // Hot-reload: new primary c (unreachable), old entry a demoted to #2.
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://c"),
             TestEntry::node("http://a"),
         ]);
-        assert_eq!(pm.report_failure(0), Some(1)); // revert to a at once
+        assert_eq!(manager.report_failure(0), Some(1)); // revert to a at once
 
         // The failed entry's cooldown extends well past the normal failover
         // window — selection keeps landing on the working fallback.
         {
-            let cands = pm.candidates.lock().unwrap();
-            let until = cands[0].retry_at_ms.load(Ordering::Relaxed);
+            let candidates = manager.candidates.lock().unwrap();
+            let until = candidates[0].retry_at_ms.load(Ordering::Relaxed);
             assert!(
                 until
                     >= PoolManager::<TestEntry>::now_ms() + REVERT_COOLDOWN.as_millis() as u64
@@ -1252,15 +1277,15 @@ mod tests {
                 "revert cooldown must be at least REVERT_COOLDOWN long"
             );
         }
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // A config reload resets all state — c becomes selectable again (and
         // will revert once more if it still cannot connect).
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://c"),
             TestEntry::node("http://a"),
         ]);
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
     }
 
     #[test]
@@ -1273,44 +1298,44 @@ mod tests {
         // cooldown (bounded cost: one probe per cycle, not per-minute
         // ping-pong). Before this, `reverted` was a dead-end lockout: only a
         // config reload could give the entry another chance.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(1); // fallback b is the verified one
+        manager.report_success(1); // fallback b is the verified one
 
         // Primary a is unreachable → one strike reverts to b.
-        assert_eq!(pm.report_failure(0), Some(1));
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.report_failure(0), Some(1));
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // Simulate REVERT_COOLDOWN elapsing.
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0]
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0]
                 .retry_at_ms
                 .store(PoolManager::<TestEntry>::now_ms() - 1, Ordering::Relaxed);
         }
         // select() re-qualifies the expired entry — the preferred entry is
         // probed again even though b is still working.
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
 
         // If it is STILL dead, one failure re-reverts at once with a fresh
         // cooldown (bounded probe cost per cycle).
-        assert_eq!(pm.report_failure(0), Some(1));
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.report_failure(0), Some(1));
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // Now it recovers: after the next cooldown expiry, select() picks it
         // and a success clears the reverted state permanently.
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0]
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0]
                 .retry_at_ms
                 .store(PoolManager::<TestEntry>::now_ms() - 1, Ordering::Relaxed);
         }
-        assert_eq!(pm.select().unwrap().index, 0);
-        pm.report_success(0);
-        assert_eq!(pm.select().unwrap().index, 0);
-        assert_eq!(pm.last_verified_index(), Some(0));
+        assert_eq!(manager.select().unwrap().index, 0);
+        manager.report_success(0);
+        assert_eq!(manager.select().unwrap().index, 0);
+        assert_eq!(manager.last_verified_index(), Some(0));
     }
 
     #[test]
@@ -1320,27 +1345,27 @@ mod tests {
         // and the hashrate line flickering to "none" on every blip is exactly
         // what this set exists to prevent. Only ABANDONMENT (threshold
         // failover / revert) removes an entry from the display.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a is working and advertised
+        manager.report_success(0); // a is working and advertised
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
 
         // One failed probe — below the failover threshold.
-        assert_eq!(pm.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(0));
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
 
         // Recovery re-proves it (no-op on the set, but must not break it).
-        pm.report_success(0);
+        manager.report_success(0);
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
     }
@@ -1350,28 +1375,28 @@ mod tests {
         // Once an entry is actually ABANDONED (threshold failover), the
         // display must not keep advertising it — and must show "none" until
         // the new selection proves its connection.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a working
+        manager.report_success(0); // a working
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
 
         // Three strikes → fail over to b.
         for _ in 0..FAIL_THRESHOLD {
-            pm.report_failure(0);
+            manager.report_failure(0);
         }
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.select().unwrap().index, 1);
         // a is abandoned: not advertised even though it "ever worked".
-        assert!(pm.active_pool().is_none());
+        assert!(manager.active_pool().is_none());
 
         // b proves its connection → now b is the active entry on display.
-        pm.report_success(1);
+        manager.report_success(1);
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://b".to_string())
         );
     }
@@ -1382,27 +1407,27 @@ mod tests {
         // advertising it — its connection cannot be live if it no longer
         // exists. Entries still in the chain keep their status (an unrelated
         // edit must not make a healthy session display as "none").
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a working and advertised
+        manager.report_success(0); // a working and advertised
 
         // Reload: b removed, a stays primary.
-        let _ = pm.replace(vec![TestEntry::node("http://a")]);
+        let _ = manager.replace(vec![TestEntry::node("http://a")]);
         assert_eq!(
-            pm.active_pool().map(|p| p.url().to_string()),
+            manager.active_pool().map(|p| p.url().to_string()),
             Some("http://a".to_string())
         );
 
         // Reload: a demoted behind new primary c (unreachable). a's status is
         // kept (still in the chain) but it is no longer active — and c was
         // never connected, so nothing may be advertised.
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://c"),
             TestEntry::node("http://a"),
         ]);
-        assert!(pm.active_pool().is_none());
+        assert!(manager.active_pool().is_none());
     }
 
     #[test]
@@ -1411,24 +1436,24 @@ mod tests {
         // failing over — a working source blipping is normal and must not
         // instantly abandon the primary (that would flap on every transient
         // error).
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a verified
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(0));
-        assert_eq!(pm.report_failure(0), Some(1)); // threshold trips → b
+        manager.report_success(0); // a verified
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(0));
+        assert_eq!(manager.report_failure(0), Some(1)); // threshold trips → b
     }
 
     #[test]
     fn replace_returns_previous_active_index() {
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(1); // active is now b (index 1)
-        let prev = pm.replace(vec![TestEntry::node("http://c")]);
+        manager.report_success(1); // active is now b (index 1)
+        let prev = manager.replace(vec![TestEntry::node("http://c")]);
         assert_eq!(prev, Some(1));
     }
 
@@ -1437,17 +1462,17 @@ mod tests {
         // The broken-validator case: the source serves jobs fine (connection
         // alive) but rejects every share. Rejections must fail over after
         // REJECT_THRESHOLD — not FAIL_THRESHOLD, and not never.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0)); // stay put
+            assert_eq!(manager.report_share_rejection(0), Some(0)); // stay put
         }
         // Threshold hit → fail over to b.
-        assert_eq!(pm.report_share_rejection(0), Some(1));
-        assert_eq!(pm.failover_count(), 1);
-        let sel = pm.select().unwrap();
+        assert_eq!(manager.report_share_rejection(0), Some(1));
+        assert_eq!(manager.failover_count(), 1);
+        let sel = manager.select().unwrap();
         assert_eq!(sel.index, 1);
     }
 
@@ -1455,19 +1480,19 @@ mod tests {
     fn accepted_share_clears_the_rejection_streak() {
         // Sporadic rejections (stale jobs after a reorg) must not accumulate:
         // an acceptance resets the streak.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
-        pm.clear_share_rejections(0); // one accepted share
-                                      // The streak restarted — the same number of rejections no longer trips.
+        manager.clear_share_rejections(0); // one accepted share
+                                           // The streak restarted — the same number of rejections no longer trips.
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
-        assert_eq!(pm.failover_count(), 0);
+        assert_eq!(manager.failover_count(), 0);
     }
 
     #[test]
@@ -1477,38 +1502,38 @@ mod tests {
         // work fetch would otherwise zero it before the submit rejection
         // could accumulate — and "serves work but cannot validate" is exactly
         // the condition this counter exists to catch.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
-        pm.report_success(0); // healthy work fetch on the same entry
-                              // The streak survived — one more rejection trips it.
-        assert_eq!(pm.report_share_rejection(0), Some(1));
+        manager.report_success(0); // healthy work fetch on the same entry
+                                   // The streak survived — one more rejection trips it.
+        assert_eq!(manager.report_share_rejection(0), Some(1));
     }
 
     #[test]
     fn replace_resets_the_rejection_streak() {
         // A config reload gives a reloaded chain fresh strikes (the source
         // may have fixed its validator in the meantime).
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         // Streak reset — the same number of rejections no longer trips.
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
-        assert_eq!(pm.failover_count(), 0);
+        assert_eq!(manager.failover_count(), 0);
     }
 
     #[test]
@@ -1516,16 +1541,16 @@ mod tests {
         // An unrelated reload (no field edits) must keep was_verified — the
         // revert rule depends on remembering which entry actually served
         // work.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a verified + connected
-        let _ = pm.replace(vec![
+        manager.report_success(0); // a verified + connected
+        let _ = manager.replace(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        assert!(pm.last_verified_index() == Some(0));
+        assert!(manager.last_verified_index() == Some(0));
     }
 
     #[test]
@@ -1533,17 +1558,17 @@ mod tests {
         // Editing wallet (or any login key) on an entry makes its credentials
         // unproven: verified status does NOT carry across the reload, and the
         // revert rule must not treat the edited entry as known-good.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        pm.report_success(0); // a verified with the OLD wallet
+        manager.report_success(0); // a verified with the OLD wallet
         let mut a = TestEntry::node("http://a");
         a.wallet = "renamed".to_string();
-        let _ = pm.replace(vec![a, TestEntry::node("http://b")]);
-        assert_eq!(pm.last_verified_index(), None);
+        let _ = manager.replace(vec![a, TestEntry::node("http://b")]);
+        assert_eq!(manager.last_verified_index(), None);
         // Selection still picks a (it is the enabled primary, just unproven).
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
     }
 
     #[test]
@@ -1556,20 +1581,20 @@ mod tests {
         // working fallback keeps being selected for the whole window; a
         // config reload resets state at once (and the entry gets another
         // chance).
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD {
-            pm.report_share_rejection(0);
+            manager.report_share_rejection(0);
         }
-        assert_eq!(pm.select().unwrap().index, 1); // on b now
+        assert_eq!(manager.select().unwrap().index, 1); // on b now
 
         // The ban cooldown extends well past the normal failover window —
         // selection keeps landing on the working fallback.
         {
-            let cands = pm.candidates.lock().unwrap();
-            let until = cands[0].retry_at_ms.load(Ordering::Relaxed);
+            let candidates = manager.candidates.lock().unwrap();
+            let until = candidates[0].retry_at_ms.load(Ordering::Relaxed);
             assert!(
                 until
                     >= PoolManager::<TestEntry>::now_ms() + REJECT_COOLDOWN.as_millis() as u64
@@ -1577,28 +1602,28 @@ mod tests {
                 "rejection ban must use at least REJECT_COOLDOWN"
             );
         }
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // The streak PERSISTS across the ban: when the cooldown expires and
         // selection probes a again, ONE rejected submission re-bans it at
         // once (one lost share) instead of burning another full threshold.
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0].retry_at_ms.store(
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0].retry_at_ms.store(
                 PoolManager::<TestEntry>::now_ms().saturating_sub(1000),
                 Ordering::Relaxed,
             );
         }
-        assert_eq!(pm.select().unwrap().index, 0); // probe: a is selected again
-        assert_eq!(pm.report_share_rejection(0), Some(1)); // one strike → re-ban
+        assert_eq!(manager.select().unwrap().index, 0); // probe: a is selected again
+        assert_eq!(manager.report_share_rejection(0), Some(1)); // one strike → re-ban
 
         // A config reload resets all state — a becomes selectable again (and
         // will be banned once more if it still rejects).
-        let _ = pm.replace(vec![
+        let _ = manager.replace(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
     }
 
     #[test]
@@ -1607,29 +1632,29 @@ mod tests {
         // works again — the streak resets and the entry is eligible for
         // selection as soon as its cooldown expires (no further strikes
         // owed).
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
         ]);
         for _ in 0..REJECT_THRESHOLD {
-            pm.report_share_rejection(0);
+            manager.report_share_rejection(0);
         }
-        assert_eq!(pm.select().unwrap().index, 1);
+        assert_eq!(manager.select().unwrap().index, 1);
 
         // The validator recovers: one accepted share clears the ban.
-        pm.clear_share_rejections(0);
+        manager.clear_share_rejections(0);
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0].retry_at_ms.store(
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0].retry_at_ms.store(
                 PoolManager::<TestEntry>::now_ms().saturating_sub(1000),
                 Ordering::Relaxed,
             );
         }
         // Selection returns to the primary — and a fresh streak means it
         // takes another full REJECT_THRESHOLD of rejections to ban it again.
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
         for _ in 0..REJECT_THRESHOLD - 1 {
-            assert_eq!(pm.report_share_rejection(0), Some(0));
+            assert_eq!(manager.report_share_rejection(0), Some(0));
         }
     }
 
@@ -1637,37 +1662,37 @@ mod tests {
     fn fail_immediately_rotates_past_the_failed_entry() {
         // Login rejection is one strike: even with the threshold untripped,
         // selection moves to the next candidate at once.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::stratum("p:1", "W"),
         ]);
-        pm.report_success(0); // a verified and active
-        assert_eq!(pm.fail_immediately(0), Some(1));
-        assert_eq!(pm.failover_count(), 1);
-        assert_eq!(pm.select().unwrap().index, 1);
+        manager.report_success(0); // a verified and active
+        assert_eq!(manager.fail_immediately(0), Some(1));
+        assert_eq!(manager.failover_count(), 1);
+        assert_eq!(manager.select().unwrap().index, 1);
         // a is on cooldown (RETRY_AFTER); a success on it clears that.
         {
-            let cands = pm.candidates.lock().unwrap();
-            cands[0].retry_at_ms.store(
+            let candidates = manager.candidates.lock().unwrap();
+            candidates[0].retry_at_ms.store(
                 PoolManager::<TestEntry>::now_ms().saturating_sub(1000),
                 Ordering::Relaxed,
             );
         }
-        assert_eq!(pm.select().unwrap().index, 0);
-        pm.report_success(0);
-        assert_eq!(pm.select().unwrap().index, 0);
+        assert_eq!(manager.select().unwrap().index, 0);
+        manager.report_success(0);
+        assert_eq!(manager.select().unwrap().index, 0);
     }
 
     #[test]
     fn pool_identities_lists_every_entry_in_config_order() {
         // Disabled entries keep their index — identity diffing must see them
         // so a hot-reload that flips `enabled` is detected by position.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::stratum("p:1", "W"),
             TestEntry::node("http://c"),
         ]);
-        let ids = pm.pool_identities();
+        let ids = manager.pool_identities();
         assert_eq!(ids.len(), 3);
         assert!(ids[0].contains("http://a"));
         assert!(ids[1].contains("p:1"));
@@ -1680,20 +1705,26 @@ mod tests {
     fn pool_identity_enabled_carries_the_flag() {
         // The (identity, enabled) pairs let consumers detect an
         // enabled-only toggle that identity() alone cannot represent.
-        let pm = chain(vec![
+        let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::stratum("p:1", "W"),
         ]);
-        let pairs = pm.pool_identity_enabled();
+        let pairs = manager.pool_identity_enabled();
         assert_eq!(pairs.len(), 2);
         assert!(pairs[0].1, "node default enabled");
         assert!(pairs[1].1, "stratum default enabled");
 
-        let pm2 = chain(vec![TestEntry::stratum_disabled("p:1", "W")]);
-        let pairs2 = pm2.pool_identity_enabled();
-        assert_eq!(pairs2.len(), 1);
-        assert!(!pairs2[0].1, "disabled entry carries enabled=false");
-        assert_eq!(pairs2[0].0, pairs[1].0, "same identity, different flag");
+        let manager2 = chain(vec![TestEntry::stratum_disabled("p:1", "W")]);
+        let identity_pairs2 = manager2.pool_identity_enabled();
+        assert_eq!(identity_pairs2.len(), 1);
+        assert!(
+            !identity_pairs2[0].1,
+            "disabled entry carries enabled=false"
+        );
+        assert_eq!(
+            identity_pairs2[0].0, pairs[1].0,
+            "same identity, different flag"
+        );
     }
 
     #[test]
@@ -1703,37 +1734,37 @@ mod tests {
         // fail_immediately / report_share_rejection) previously locked
         // candidates→pools. Under contention that deadlocked. Hammer both
         // directions from separate threads; a watchdog panics on hang.
-        let pm = std::sync::Arc::new(chain(vec![
-            TestEntry::stratum("ws://a", "w1"),
-            TestEntry::stratum("ws://b", "w2"),
-            TestEntry::stratum("ws://c", "w3"),
+        let manager = std::sync::Arc::new(chain(vec![
+            TestEntry::stratum("source_kind://a", "w1"),
+            TestEntry::stratum("source_kind://b", "w2"),
+            TestEntry::stratum("source_kind://c", "w3"),
         ]));
         let stop = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::new();
 
         // Hot-reload style replace() churn.
-        let pm1 = pm.clone();
+        let pm1 = manager.clone();
         let stop1 = stop.clone();
         handles.push(std::thread::spawn(move || {
             while !stop1.load(Ordering::Relaxed) {
                 pm1.replace(vec![
-                    TestEntry::stratum("ws://a", "w1"),
-                    TestEntry::stratum("ws://b", "w2"),
+                    TestEntry::stratum("source_kind://a", "w1"),
+                    TestEntry::stratum("source_kind://b", "w2"),
                 ]);
             }
         }));
 
         // Failure-accounting churn (the reverse-order side).
-        let pm2 = pm.clone();
-        drop(pm);
+        let manager2 = manager.clone();
+        drop(manager);
         let stop2 = stop.clone();
         handles.push(std::thread::spawn(move || {
             while !stop2.load(Ordering::Relaxed) {
-                let _ = pm2.report_failure(0);
-                let _ = pm2.report_share_rejection(1);
-                pm2.fail_immediately(2);
-                pm2.report_success(0);
-                pm2.clear_share_rejections(1);
+                let _ = manager2.report_failure(0);
+                let _ = manager2.report_share_rejection(1);
+                manager2.fail_immediately(2);
+                manager2.report_success(0);
+                manager2.clear_share_rejections(1);
             }
         }));
 

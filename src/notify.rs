@@ -169,6 +169,7 @@ pub fn log_delivery_failure<E: std::fmt::Display>(channel: &str, err: E) {
 /// SMTP-backed implementation of [`Channel`] (lettre, async Tokio1).
 /// All credentials are redacted in logs; the miner identity is included in
 /// every message for differentiation across instances.
+#[derive(Clone)]
 pub struct EmailChannel {
     pub host: String,
     pub port: u16,
@@ -248,16 +249,7 @@ impl Channel for EmailChannel {
     /// Render the event into an email and hand it to the async dispatch
     /// helper. Never blocks the caller.
     fn deliver(&self, event: &EmailEvent, miner_id: &str) {
-        let this = Self {
-            host: self.host.clone(),
-            port: self.port,
-            from_address: self.from_address.clone(),
-            to_addresses: self.to_addresses.clone(),
-            username: self.username.clone(),
-            password: self.password.clone(),
-            ssl_tls: self.ssl_tls,
-            product: self.product.clone(),
-        };
+        let this = self.clone();
         let miner_id = miner_id.to_string();
         let event = event.clone();
 
@@ -285,16 +277,7 @@ impl Channel for EmailChannel {
     /// can exit immediately after, and a detached dispatch task would be
     /// killed before the SMTP exchange finishes.
     fn deliver_blocking(&self, event: &EmailEvent, miner_id: &str) {
-        let this = Self {
-            host: self.host.clone(),
-            port: self.port,
-            from_address: self.from_address.clone(),
-            to_addresses: self.to_addresses.clone(),
-            username: self.username.clone(),
-            password: self.password.clone(),
-            ssl_tls: self.ssl_tls,
-            product: self.product.clone(),
-        };
+        let this = self.clone();
         let miner_id = miner_id.to_string();
         let event = event.clone();
         let handle = std::thread::spawn(move || {

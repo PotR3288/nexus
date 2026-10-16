@@ -267,10 +267,16 @@ pub fn validate_and_write<T: serde::de::DeserializeOwned>(
     let out = toml::to_string_pretty(merged)
         .map_err(|e| format!("failed serializing merged config: {e}"))?;
 
-    // Atomic replace: temp file in the same directory + rename. The watcher's
-    // mtime poll picks it up within ~2s.
+    // Atomic replace: temp file in the same directory + rename. The temp
+    // name derives from the target file so two configs in one directory
+    // never collide, and the pid defeats stale temp files from a previous
+    // run. The watcher's mtime poll picks it up within ~2s.
     let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".config.toml.{}.tmp", std::process::id()));
+    let file_stem = Path::new(path)
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config".to_string());
+    let tmp = dir.join(format!(".{file_stem}.{}.tmp", std::process::id()));
     std::fs::write(&tmp, out).map_err(|e| format!("failed writing temp config: {e}"))?;
     if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);

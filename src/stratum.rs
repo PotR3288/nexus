@@ -27,9 +27,10 @@
 //! - `keepalive` `{id}` — send periodically; pools drop silent miners.
 //!
 //! xmrig's `target` field: the hex string is a 4-byte little-endian u32
-//! (`tmp`); xmrig's share target is `u64::MAX / (u32::MAX / tmp)`, which
+//! (`target_u32`); xmrig's share target is `u64::MAX / (u32::MAX / target_u32)`,
+//! which
 //! under the `hash < u64::MAX / difficulty` check equals pool difficulty
-//! `u32::MAX / tmp`.
+//! `u32::MAX / target_u32`.
 
 use log::{debug, info, warn};
 use serde_json::{json, Value};
@@ -48,6 +49,20 @@ pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
 pub const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Login response deadline.
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// JSON-RPC id of the login request (pools echo it in the reply; the reader
+/// loop correlates by id and must not count the login reply as a share).
+pub const LOGIN_REQUEST_ID: u64 = 1;
+/// JSON-RPC id of every keepalive request.
+pub const KEEPALIVE_REQUEST_ID: u64 = 2;
+/// First correlating id handed to a queued share submit (submits count up
+/// from here; 1/2 are reserved for login/keepalive so a pool echoing a
+/// stale id can never be mistaken for a share reply).
+pub const FIRST_SUBMIT_ID: u64 = 100;
+/// Placeholder id on the submit envelope built by `submit_with_ack` — the
+/// reader loop always overwrites it with the correlating id
+/// (>= [`FIRST_SUBMIT_ID`]) before the frame leaves the socket.
+pub const SUBMIT_REQUEST_ID: u64 = 3;
 
 /// Maximum bytes for a single stratum line (login replies AND session
 /// pushes/replies). A malicious or broken pool must not be able to grow an
@@ -182,7 +197,7 @@ pub fn login(
 ) -> Result<LoginOutcome, String> {
     let req = json!({
         "jsonrpc": "2.0",
-        "id": 1,
+        "id": LOGIN_REQUEST_ID,
         "method": "login",
         "params": {
             "login": login_str,
@@ -207,7 +222,7 @@ pub fn login(
             Ok(v) => v,
             Err(_) => continue, // tolerate garbage lines
         };
-        if msg.get("id") != Some(&json!(1)) {
+        if msg.get("id") != Some(&json!(LOGIN_REQUEST_ID)) {
             continue;
         }
         if let Some(err) = msg.get("error").filter(|e| !e.is_null()) {
@@ -235,11 +250,12 @@ pub fn login(
 }
 
 /// xmrig's `setTarget` for an 8-hex-char target: the 4 bytes are read as a
-/// little-endian u32 (`tmp`), and xmrig's share target becomes
-/// `u64::MAX / (u32::MAX / tmp)` ≈ `tmp * 2^32`. Since both miners' share
-/// check is `hash < u64::MAX / difficulty`, the equivalent pool difficulty
-/// is `u32::MAX / tmp` (verified against live xtm-rx targets:
-/// f1290000 → tmp 10737 → diff 400015; e2530000 → tmp 21474 → diff 200007).
+/// little-endian u32 (`target_u32`), and xmrig's share target becomes
+/// `u64::MAX / (u32::MAX / target_u32)` ≈ `target_u32 * 2^32`. Since both
+/// miners' share check is `hash < u64::MAX / difficulty`, the equivalent
+/// pool difficulty is `u32::MAX / target_u32` (verified against live
+/// xtm-rx targets: f1290000 → target_u32 10737 → diff 400015; e2530000 →
+/// target_u32 21474 → diff 200007).
 pub fn target_to_difficulty(target_hex: &str) -> Result<u64, String> {
     let bytes = hex_decode(target_hex)?;
     if bytes.len() != 4 {
@@ -248,11 +264,11 @@ pub fn target_to_difficulty(target_hex: &str) -> Result<u64, String> {
             bytes.len()
         ));
     }
-    let tmp = u32::from_le_bytes(bytes.try_into().unwrap());
-    if tmp == 0 {
+    let target_u32 = u32::from_le_bytes(bytes.try_into().unwrap());
+    if target_u32 == 0 {
         return Err("target is zero".to_string());
     }
-    let difficulty = u32::MAX as u64 / tmp as u64;
+    let difficulty = u32::MAX as u64 / target_u32 as u64;
     if difficulty == 0 {
         return Err("target above u32::MAX — zero difficulty".to_string());
     }
@@ -489,7 +505,7 @@ impl<J: Send + Clone + 'static> Session<J> {
         &self,
         params: Value,
     ) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
-        let req = json!({"jsonrpc": "2.0", "id": 3, "method": "submit", "params": params});
+        let req = json!({"jsonrpc": "2.0", "id": SUBMIT_REQUEST_ID, "method": "submit", "params": params});
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.submit_tx
             .lock()
@@ -541,7 +557,7 @@ pub fn run_reader_loop<J: Clone>(
     // Id-correlated reply accounting: only errors/results matching a queued
     // submit id count as share accept/reject.
     let mut pending_submits: std::collections::HashSet<u64> = std::collections::HashSet::new();
-    let mut next_submit_id: u64 = 100;
+    let mut next_submit_id: u64 = FIRST_SUBMIT_ID;
     let mut keepalive_disabled = false;
     loop {
         if reader_shutdown.load(Ordering::Relaxed) {
@@ -552,7 +568,7 @@ pub fn run_reader_loop<J: Clone>(
         if !keepalive_disabled && last_keepalive.elapsed() >= keepalive_interval {
             let ka = json!({
                 "jsonrpc": "2.0",
-                "id": 2,
+                "id": KEEPALIVE_REQUEST_ID,
                 "method": "keepalive",
                 "params": {"id": session_id}
             });
@@ -687,7 +703,7 @@ mod tests {
     #[test]
     fn target_to_difficulty_matches_observed_pool_values() {
         // Observed live from xtm-rx-us.kryptex.network:7038 jobs:
-        // f1290000 → tmp 10737 → difficulty 400015; e2530000 → 21474 → 200007.
+        // f1290000 → target_u32 10737 → difficulty 400015; e2530000 → 21474 → 200007.
         assert_eq!(target_to_difficulty("f1290000").unwrap(), 400_015);
         assert_eq!(target_to_difficulty("e2530000").unwrap(), 200_007);
         assert!(target_to_difficulty("00000000").is_err());

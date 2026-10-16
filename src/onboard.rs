@@ -19,6 +19,7 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
+use std::time::Duration;
 
 /// Outcome of a single check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +202,11 @@ pub fn tcp_reachable(host: &str, port: u16, timeout: std::time::Duration) -> Res
     Ok(false)
 }
 
+/// TCP-connect deadline used by [`endpoint_check`] for pool/node probes —
+/// long enough for a cold DNS+connect round trip, short enough that a
+/// dead endpoint does not stall `--check` noticeably.
+pub const CHECK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Run a TCP reachability check and fold it into a [`Check`] (shared by both
 /// miners' `--check` for pool endpoints / base-node addresses). A success
 /// proves routing + a listening socket, NOT protocol correctness.
@@ -211,7 +217,7 @@ pub fn endpoint_check(name: &str, endpoint: &str, default_port: u16, protocol_no
             format!("endpoint '{endpoint}' is not a host:port address"),
             "Set a host:port endpoint (e.g. pool.example.com:3333).",
         ),
-        Some((host, port)) => match tcp_reachable(&host, port, std::time::Duration::from_secs(5)) {
+        Some((host, port)) => match tcp_reachable(&host, port, CHECK_CONNECT_TIMEOUT) {
             Ok(true) => Check::pass(
                 name,
                 format!("{endpoint} is reachable ({protocol_note} not verified — the first real connection decides that)"),
