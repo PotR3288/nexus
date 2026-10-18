@@ -121,17 +121,12 @@ pub trait WorkSourceEntry: Clone + Send + Sync + 'static {
     fn enabled(&self) -> bool;
 }
 
-/// Log clean text to logfile AND print bold-red on the console. Failover and
-/// pool-outage decisions are operator-facing incidents — they must be visible
-/// in a live screen/SSH session, not only in the log file. Colors emit
-/// unconditionally unless NO_COLOR is set (miners typically run under
-/// screen/systemd where stderr is not a tty but output is still watched).
+/// Log a failover/pool-outage decision as an error. Since tracing gained its
+/// stdout fmt layer, that layer IS the console output — the old unconditional
+/// bold-red eprintln! printed a second copy on every live screen/SSH session.
+/// Plain tracing call: one line on console, one in the file, never two.
 pub fn console_error(line: &str) {
     error!("{}", line);
-    static NO_COLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*NO_COLOR.get_or_init(|| std::env::var_os("NO_COLOR").is_some()) {
-        eprintln!("\x1b[1;31m{}\x1b[0m", line);
-    }
 }
 
 /// Consecutive work failures before failing over to the next entry.
