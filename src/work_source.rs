@@ -42,7 +42,7 @@
 //! `node` (edgecase gRPC base node), `proxy` (xtminer's xmrig_proxy), and
 //! `stratum`. The manager never branches on the kind — only drivers do.
 
-use log::{error, info, warn};
+use log::{info, warn};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -121,12 +121,12 @@ pub trait WorkSourceEntry: Clone + Send + Sync + 'static {
     fn enabled(&self) -> bool;
 }
 
-/// Log a failover/pool-outage decision as an error. Since tracing gained its
-/// stdout fmt layer, that layer IS the console output — the old unconditional
-/// bold-red eprintln! printed a second copy on every live screen/SSH session.
-/// Plain tracing call: one line on console, one in the file, never two.
+/// Print a failover/pool-outage decision on the console: bold red when stderr
+/// is a tty, plain otherwise. Console output is curated eprintln! only (see
+/// logging.rs) — this writes stderr directly, never a tracing line, so it
+/// shows exactly once regardless of tracing filter levels.
 pub fn console_error(line: &str) {
-    error!("{}", line);
+    crate::logging::stderr_colored(line, "1;31");
 }
 
 /// Consecutive work failures before failing over to the next entry.
