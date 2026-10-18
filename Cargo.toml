@@ -17,11 +17,14 @@ arc-swap = "1"
 # dispatcher. tiny_http version pinned to match both miners (0.12).
 tiny_http = "0.12"
 
-# Logging facade: both miners run tracing subscribers, and
-# tracing-subscriber's .init() installs the tracing-log bridge that forwards
-# these log:: events into them (verified live in both xtminer and edgecase).
-# The shared crate MUST NOT pull in a logging implementation.
+# Logging facade: nexus modules log via tracing:: macros directly.
 log = "0.4"
+
+# Shared subscriber wiring (logging.rs): one registry, stdout + ansi-free
+# file layers behind a single reloadable EnvFilter. Apps keep their own
+# filter policy and call logging::init_stdout_and_file once from main.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 
 # Email notifications (SMTP) — the shared notification channel.
 lettre = { version = "0.11", default-features = false, features = ["rustls-tls", "smtp-transport", "builder", "tokio1-rustls-tls"] }
