@@ -302,7 +302,12 @@ pub fn confirm_with(reader: &mut dyn BufRead, prompt: &str, default: bool) -> bo
 /// Write config content atomically (temp file + rename in the same directory,
 /// same durability rule as the API's PUT /config path). Refuses to overwrite
 /// an existing file — the caller must check-and-confirm first; this is the
-/// last-resort guard so a wizard can never clobber a live config.
+/// last-resort guard so a wizard can never clobber a live config. When run
+/// via sudo, the written file is chowned back to the invoking user — detected
+/// through SUDO_UID, because plain `sudo` runs its child with real uid 0 and
+/// getuid() cannot identify the invoker. A root-owned 600 config would be
+/// unreadable on their next non-sudo run and uneditable in their editor,
+/// while root can still read it either way.
 pub fn write_config_atomic(path: &Path, content: &str) -> Result<(), String> {
     if path.exists() {
         return Err(format!(
@@ -332,8 +337,55 @@ pub fn write_config_atomic(path: &Path, content: &str) -> Result<(), String> {
             // address and possibly pool credentials.
             #[cfg(unix)]
             {
-                use std::os::unix::fs::PermissionsExt;
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
                 let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                // Running as root? Figure out who invoked us and hand the file
+                // back: via sudo, chown to the invoking user so their next
+                // non-sudo run (and editor) can use it; from a genuine root
+                // shell there is no one to hand it back to — say so. Best-
+                // effort either way: never fail the wizard over ownership.
+                if unsafe { libc::geteuid() } == 0 {
+                    // Plain `sudo` does not preserve the invoking uid in
+                    // getuid() (the child runs with real uid 0 on most
+                    // systems), so SUDO_UID — which sudo always sets for the
+                    // command it launches — is the reliable signal.
+                    match std::env::var("SUDO_UID") {
+                        Ok(sudo_uid) if sudo_uid != "0" => {
+                            let uid: libc::uid_t =
+                                sudo_uid.parse().unwrap_or(unsafe { libc::getuid() });
+                            // Prefer the invoking user's group (sudo sets it);
+                            // fall back to the file's current group.
+                            let gid: libc::gid_t = std::env::var("SUDO_GID")
+                                .ok()
+                                .and_then(|g| g.parse().ok())
+                                .unwrap_or_else(|| {
+                                    std::fs::metadata(path).map(|m| m.gid()).unwrap_or(uid as _)
+                                });
+                            use std::os::unix::ffi::OsStrExt;
+                            let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+                                Ok(c) => c,
+                                Err(_) => return, // NUL byte in a path: impossible on unix
+                            };
+                            match unsafe { libc::chown(c_path.as_ptr(), uid, gid) } {
+                                0 => println!(
+                                    "\nNote: you ran this as root — {} is owned by your user account so it can be edited without sudo.",
+                                    path.display()
+                                ),
+                                _ => eprintln!(
+                                    "\nWarning: running as root but could not hand {} back to uid {uid}: {}",
+                                    path.display(),
+                                    std::io::Error::last_os_error()
+                                ),
+                            }
+                        }
+                        // No SUDO_UID (or invoking user was root): genuinely
+                        // running AS root — nothing to hand back.
+                        _ => println!(
+                            "\nNote: you are running as root — {} will be owned by root.",
+                            path.display()
+                        ),
+                    }
+                }
             }
         })
 }
@@ -410,6 +462,14 @@ mod tests {
         let fresh = dir.path().join("fresh.toml");
         write_config_atomic(&fresh, "a = 1\n").unwrap();
         assert_eq!(std::fs::read_to_string(&fresh).unwrap(), "a = 1\n");
+        // Wizard-written configs are private: they hold a wallet address and
+        // possibly pool credentials.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         // No temp litter left behind.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
