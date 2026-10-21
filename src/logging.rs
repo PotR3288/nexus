@@ -14,6 +14,7 @@
 //! never install a subscriber, only expose these entry points for apps to
 //! call once from main.
 
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{
@@ -76,7 +77,10 @@ pub fn init_file_only(
 /// `code` is an SGR parameter string, e.g. "1;32" for bold green,
 /// "1;31" for bold red, "2" for dim, "1" for bold. Pass "" for plain.
 pub fn stderr_colored(line: &str, code: &str) {
-    if code.is_empty() || unsafe { libc::isatty(libc::STDERR_FILENO) == 0 } {
+    // std::io::IsTerminal is the portable tty check (isatty(2) on unix,
+    // GetConsoleMode on windows) — libc's STDERR_FILENO does not exist on
+    // Windows.
+    if code.is_empty() || !std::io::stderr().is_terminal() {
         eprintln!("{line}");
     } else {
         eprintln!("\x1b[{code}m{line}\x1b[0m");
