@@ -278,7 +278,7 @@ pub fn target_to_difficulty(target_hex: &str) -> Result<u64, String> {
 /// hex decode with a clean error (both miners use the `hex` crate; this
 /// keeps nexus dependency-light).
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("odd-length hex string: {s}"));
     }
     (0..s.len())
@@ -304,12 +304,15 @@ pub struct SubmitMsg {
     pub ack: Option<std::sync::mpsc::Sender<Result<(), String>>>,
 }
 
+/// A raw-job parse callback (see [`JobParser`]).
+pub type ParseFn<J> = Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>;
+
 /// Reader-loop side effects. The session owns the share counters; these
 /// hooks carry the miner-specific accounting (failover strikes, logs,
 /// notifications).
 pub struct ReaderHooks<J> {
     /// Parse a raw job (login job or `job` push) into the miner's type.
-    pub parse: Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>,
+    pub parse: ParseFn<J>,
     /// A share was ACCEPTED (counter already incremented). Reset rejection
     /// streaks here (an accepted share proves the pool's validation path
     /// works — sporadic rejections must not accumulate toward failover).
@@ -325,7 +328,7 @@ pub struct ReaderHooks<J> {
 }
 
 impl<J> ReaderHooks<J> {
-    pub fn new(parse: Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>) -> Self {
+    pub fn new(parse: ParseFn<J>) -> Self {
         Self {
             parse,
             on_share_accepted: Arc::new(|| {}),

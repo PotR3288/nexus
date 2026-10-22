@@ -498,17 +498,13 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // never be inverted).
         let (url, enabled, was_verified) = {
             let pools = self.pools.lock().unwrap();
-            match pools.get(index) {
-                Some(p) => {
-                    let candidates = self.candidates.lock().unwrap();
-                    (
-                        p.url().to_string(),
-                        p.enabled(),
-                        candidates[index].was_verified,
-                    )
-                }
-                None => return None,
-            }
+            let p = pools.get(index)?;
+            let candidates = self.candidates.lock().unwrap();
+            (
+                p.url().to_string(),
+                p.enabled(),
+                candidates[index].was_verified,
+            )
         };
         if !enabled {
             return None;

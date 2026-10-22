@@ -29,6 +29,13 @@ pub const DEBOUNCE: Duration = Duration::from_millis(300);
 /// are wait-free.
 pub type SharedConfig<C> = Arc<ArcSwap<C>>;
 
+/// A config loader callback: parse a file path into a fresh `C`.
+pub type Loader<C> = Arc<dyn Fn(&str) -> Result<C, LoadError> + Send + Sync>;
+/// A describe callback: summarize old→new changes as human-readable text.
+pub type DescribeFn<C> = Arc<dyn Fn(&C, &C) -> String + Send + Sync>;
+/// An optional live-apply callback run after validation, before the swap.
+pub type ApplyFn<C> = Arc<dyn Fn(&C, &C) + Send + Sync>;
+
 /// Wrap an already-loaded config for sharing.
 pub fn shared<C>(config: C) -> SharedConfig<C> {
     Arc::new(ArcSwap::from_pointee(config))
@@ -49,16 +56,13 @@ pub fn shared<C>(config: C) -> SharedConfig<C> {
 ///   pool failover chain; edgecase: apply tracing log level / hashrate-only
 ///   flag). Runs after validation, before the swap.
 pub struct ReloadHooks<C> {
-    pub describe_live: Arc<dyn Fn(&C, &C) -> String + Send + Sync>,
-    pub describe_restart: Arc<dyn Fn(&C, &C) -> String + Send + Sync>,
-    pub on_applied: Option<Arc<dyn Fn(&C, &C) + Send + Sync>>,
+    pub describe_live: DescribeFn<C>,
+    pub describe_restart: DescribeFn<C>,
+    pub on_applied: Option<ApplyFn<C>>,
 }
 
 impl<C> ReloadHooks<C> {
-    pub fn new(
-        describe_live: Arc<dyn Fn(&C, &C) -> String + Send + Sync>,
-        describe_restart: Arc<dyn Fn(&C, &C) -> String + Send + Sync>,
-    ) -> Self {
+    pub fn new(describe_live: DescribeFn<C>, describe_restart: DescribeFn<C>) -> Self {
         Self {
             describe_live,
             describe_restart,
@@ -75,7 +79,7 @@ struct Watcher<C> {
     /// Re-applied after every reload so an explicit CLI flag keeps outranking
     /// the file for the whole process lifetime.
     apply_overrides: Arc<dyn Fn(&mut C) + Send + Sync>,
-    loader: Arc<dyn Fn(&str) -> Result<C, LoadError> + Send + Sync>,
+    loader: Loader<C>,
     /// mtime of the last applied file (0 = never seen).
     last_mtime_ms: AtomicU64,
 }
@@ -181,7 +185,7 @@ impl<C> Watcher<C> {
 pub fn spawn_watcher<C>(
     path: String,
     shared: SharedConfig<C>,
-    loader: Arc<dyn Fn(&str) -> Result<C, LoadError> + Send + Sync>,
+    loader: Loader<C>,
     apply_overrides: Arc<dyn Fn(&mut C) + Send + Sync>,
     hooks: ReloadHooks<C>,
     shutdown: Arc<AtomicBool>,
@@ -262,7 +266,7 @@ mod tests {
         }
     }
 
-    fn loader() -> Arc<dyn Fn(&str) -> Result<TestConfig, LoadError> + Send + Sync> {
+    fn loader() -> Loader<TestConfig> {
         Arc::new(
             |p: &str| match crate::config_util::load_toml_config::<TestConfig>(p) {
                 crate::config_util::ConfigLoad::Loaded(c) => Ok(c),

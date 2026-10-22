@@ -17,9 +17,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{
-    layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter,
-};
+use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
 
 /// `logs/miner.log` next to the process cwd (the cwd holding config.toml).
 /// The `GET /log?lines=N` endpoint tails this file — keep the path stable.
