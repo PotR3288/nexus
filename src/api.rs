@@ -449,13 +449,16 @@ pub fn schedule_restart_with_failure_prefix(failure_prefix: &str) {
             }
             #[cfg(not(unix))]
             {
-                let _ = &failure_prefix;
                 use std::os::windows::process::CommandExt;
                 let mut cmd = std::process::Command::new(&args[0]);
-                cmd.args(&args[1..])
-                    .creation_flags(0x0800_0000) // CREATE_NO_WINDOW: no console flash
-                    .spawn();
-                std::process::exit(0);
+                cmd.args(&args[1..]).creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flash
+                match cmd.spawn() {
+                    Ok(_) => std::process::exit(0),
+                    Err(err) => {
+                        eprintln!("{failure_prefix} restart spawn failed ({err})");
+                        std::process::exit(1);
+                    }
+                }
             }
         })
         .ok();

@@ -81,6 +81,55 @@ pub fn stderr_colored(line: &str, code: &str) {
     if code.is_empty() || !std::io::stderr().is_terminal() {
         eprintln!("{line}");
     } else {
+        #[cfg(windows)]
+        win_vt::enable();
         eprintln!("\x1b[{code}m{line}\x1b[0m");
+    }
+}
+
+/// Windows console VT processing, enabled lazily on first colored line.
+///
+/// A console allocated by Explorer (double-clicking the .exe) starts with
+/// `ENABLE_VIRTUAL_TERMINAL_PROCESSING` OFF, so raw SGR escape bytes render
+/// as garbage characters; a pre-existing terminal (cmd, PowerShell) already
+/// has it ON, which is why the same binary looks fine from a shell. Enabling
+/// the mode on both std handles makes double-clicked launches format
+/// identically to command-line ones. kernel32 is linked by default on all
+/// Windows targets — no extra dependency.
+#[cfg(windows)]
+mod win_vt {
+    use std::sync::Once;
+
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const STD_ERROR_HANDLE: i32 = -12;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    static ENABLED: Once = Once::new();
+
+    pub fn enable() {
+        ENABLED.call_once(|| unsafe {
+            for n in [STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                let h = GetStdHandle(n);
+                // NULL (no console) or INVALID_HANDLE_VALUE (-1): skip.
+                if h == 0 || h == -1 {
+                    continue;
+                }
+                let mut mode: u32 = 0;
+                // Fails when the handle is not a real console (redirected);
+                // nothing to enable there.
+                if GetConsoleMode(h as *mut std::ffi::c_void, &mut mode) != 0 {
+                    SetConsoleMode(
+                        h as *mut std::ffi::c_void,
+                        mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                    );
+                }
+            }
+        });
+    }
+
+    extern "system" {
+        fn GetStdHandle(nStdHandle: i32) -> isize;
+        fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+        fn SetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, dwMode: u32) -> i32;
     }
 }
