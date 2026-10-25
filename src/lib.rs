@@ -4,8 +4,9 @@
 //!
 //! Everything in this crate is host plumbing both miners need identically:
 //! config file machinery, the xmrig-compatible HTTP status API core, the
-//! watcher, the notification dispatcher, work-source failover, and stratum
-//! framing. Miner-specific logic (config schemas, PoW algorithms, solver
+//! watcher, the notification dispatcher, work-source failover, stratum
+//! framing, and curated console output (colored lines + the pre-data
+//! spinner). Miner-specific logic (config schemas, PoW algorithms, solver
 //! dispatch, mining loops) stays in the miner repos; here it is expressed as
 //! small traits the miners implement.
 //!
@@ -18,6 +19,7 @@ pub mod config_util;
 pub mod logging;
 pub mod notify;
 pub mod onboard;
+pub mod spinner;
 pub mod stratum;
 pub mod watch;
 pub mod work_source;

@@ -74,18 +74,48 @@ pub fn init_file_only(
 ///
 /// `code` is an SGR parameter string, e.g. "1;32" for bold green,
 /// "1;31" for bold red, "2" for dim, "1" for bold. Pass "" for plain.
+///
+/// The write is serialized with the console spinner (`spinner::start`): if a
+/// frame is in flight it is erased first so this line lands on its own row,
+/// and the next frame re-establishes the spinner below it.
 pub fn stderr_colored(line: &str, code: &str) {
     // std::io::IsTerminal is the portable tty check (isatty(2) on unix,
     // GetConsoleMode on windows) — libc's STDERR_FILENO does not exist on
     // Windows.
     if code.is_empty() || !std::io::stderr().is_terminal() {
-        eprintln!("{line}");
+        crate::spinner::with_console(|| {
+            crate::spinner::erase_if_active();
+            eprintln!("{line}");
+        });
     } else {
-        #[cfg(windows)]
-        win_vt::enable();
-        eprintln!("\x1b[{code}m{line}\x1b[0m");
+        ensure_console_vt();
+        crate::spinner::with_console(|| {
+            crate::spinner::erase_if_active();
+            eprintln!("\x1b[{code}m{line}\x1b[0m");
+        });
     }
 }
+
+/// Print a fully-formed console line to stderr — the caller owns any ANSI
+/// styling (e.g. NO_COLOR-gated highlights that color even when stderr is
+/// not a tty, which `stderr_colored`'s tty gate would strip). Same
+/// spinner coordination as [`stderr_colored`]: an in-flight frame is erased
+/// first so the line lands on its own row.
+pub fn console_line(line: &str) {
+    crate::spinner::with_console(|| {
+        crate::spinner::erase_if_active();
+        eprintln!("{line}");
+    });
+}
+
+/// Enable Windows console VT processing (no-op off-Windows).
+#[cfg(windows)]
+pub(crate) fn ensure_console_vt() {
+    win_vt::enable();
+}
+
+#[cfg(not(windows))]
+pub(crate) fn ensure_console_vt() {}
 
 /// Windows console VT processing, enabled lazily on first colored line.
 ///
