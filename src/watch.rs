@@ -139,21 +139,14 @@ impl<C> Watcher<C> {
     /// untouched.
     fn try_reload(&self) -> bool {
         match (self.loader)(&self.path) {
-            Ok(mut new_cfg) => {
-                (self.apply_overrides)(&mut new_cfg);
-                let old = self.shared.load();
-                let applied = (self.hooks.describe_live)(old.as_ref(), &new_cfg);
-                if !applied.is_empty() {
-                    log::info!("Config reloaded from {} — applied: {}", self.path, applied);
-                }
-                if let Some(on_applied) = &self.hooks.on_applied {
-                    on_applied(old.as_ref(), &new_cfg);
-                }
-                let restart = (self.hooks.describe_restart)(old.as_ref(), &new_cfg);
-                if !restart.is_empty() {
-                    log::warn!("Config change requires RESTART to take effect: {}", restart);
-                }
-                self.shared.store(Arc::new(new_cfg));
+            Ok(new_cfg) => {
+                apply_external_reload(
+                    &self.shared,
+                    new_cfg,
+                    self.apply_overrides.as_ref(),
+                    &self.hooks,
+                    &format!("file '{}'", self.path),
+                );
                 true
             }
             Err(LoadError::NotFound) => {
@@ -169,6 +162,39 @@ impl<C> Watcher<C> {
             }
         }
     }
+}
+
+/// Apply an EXTERNALLY produced config through the same pipeline a file
+/// reload uses: re-apply CLI overrides (a flag keeps outranking any source
+/// for the whole run), log live vs restart-required changes, run the
+/// live-application hooks, and atomically swap into `shared`.
+///
+/// The Command Center poller calls this with its merged document so a
+/// centrally pushed change behaves exactly like an operator editing the file
+/// — same tiering, same side effects, same "restart required" warnings.
+/// `source` labels the log lines (e.g. "Command Center").
+pub fn apply_external_reload<C>(
+    shared: &SharedConfig<C>,
+    new_cfg: C,
+    apply_overrides: &(dyn Fn(&mut C) + Send + Sync),
+    hooks: &ReloadHooks<C>,
+    source: &str,
+) {
+    let mut cfg = new_cfg;
+    (apply_overrides)(&mut cfg);
+    let old = shared.load();
+    let applied = (hooks.describe_live)(old.as_ref(), &cfg);
+    if !applied.is_empty() {
+        log::info!("Config reloaded from {source} — applied: {applied}");
+    }
+    if let Some(on_applied) = &hooks.on_applied {
+        on_applied(old.as_ref(), &cfg);
+    }
+    let restart = (hooks.describe_restart)(old.as_ref(), &cfg);
+    if !restart.is_empty() {
+        log::warn!("Config change from {source} requires RESTART to take effect: {restart}");
+    }
+    shared.store(Arc::new(cfg));
 }
 
 /// Spawn the config watcher thread. Runs until `shutdown` is set. Returns
