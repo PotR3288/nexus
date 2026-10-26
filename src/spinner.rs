@@ -16,10 +16,11 @@
 //! exactly like `logging::stderr_colored`'s styling gate.
 //!
 //! Interleaving safety: every curated console write in this crate goes
-//! through [`with_console`] + [`erase_if_active`], so an event line that
-//! lands mid-animation first clears the spinner frame and prints on its own
-//! row; the next frame then re-establishes the spinner one row below. The
-//! two can never corrupt each other's text.
+//! through [`with_console`] + [`clear_current_row`], so each line ALWAYS
+//! starts by clearing whatever is on its row — an event line that lands
+//! mid-animation clears the spinner frame and prints on its own row, and a
+//! line racing `stop` (flag already cleared, final frame not yet erased)
+//! still lands clean. The two can never corrupt each other's text.
 
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,11 +57,17 @@ pub(crate) fn with_console<F: FnOnce()>(f: F) {
     f();
 }
 
-/// Erase an in-flight spinner frame so the caller's line starts on a clean
-/// row. No-op when no spinner is active or stderr is not a tty (the spinner
-/// can only be active in that case). MUST be called inside [`with_console`].
-pub(crate) fn erase_if_active() {
-    if ACTIVE.load(Ordering::Relaxed) && std::io::stderr().is_terminal() {
+/// Clear the current row so the caller's line starts on a clean one —
+/// unconditionally when stderr is a tty (a no-op elsewhere, keeping piped
+/// output clean). Self-defensive by design: it does NOT check whether a
+/// spinner is active, because any writer may race a concurrent [`stop`]
+/// that has already cleared the flag but not yet erased the final frame.
+/// MUST be called inside [`with_console`].
+pub(crate) fn clear_current_row() {
+    if std::io::stderr().is_terminal() {
+        // Windows consoles allocated by Explorer start with VT processing
+        // OFF — enable it before any escape byte (no-op off-Windows).
+        crate::logging::ensure_console_vt();
         let mut err = std::io::stderr();
         // Stderr is unbuffered — the bytes land immediately.
         let _ = write!(err, "\x1b[2K\r");
@@ -135,8 +142,13 @@ pub fn stop() {
         // takes it, and holding both would invert nothing but is needless.
         drop(handle);
         let _ = h.join();
+        // Erase the final frame AFTER the join so no late frame can land on
+        // top of it. This must NOT go through clear_current_row's callers'
+        // usual path only: ACTIVE is already false here, and a concurrent
+        // line writer may have raced ahead — clearing again under the lock
+        // is cheap and makes retirement total.
+        with_console(clear_current_row);
     }
-    with_console(erase_if_active);
 }
 
 #[cfg(test)]
@@ -188,10 +200,22 @@ mod tests {
     }
 
     #[test]
-    fn erase_if_active_is_quiet_when_inactive() {
-        // No spinner running: the hook must not emit any bytes (it would
-        // corrupt clean piped output). Not observable without capturing
-        // stderr, but it must at least be side-effect-free and non-panicking.
-        with_console(erase_if_active);
+    fn clear_current_row_is_quiet_when_inactive() {
+        // No spinner running and (in this test harness) stderr not a tty:
+        // the hook must emit no bytes at all — it would corrupt clean piped
+        // output. Not observable without capturing stderr, but it must be
+        // side-effect-free and non-panicking.
+        with_console(clear_current_row);
+    }
+
+    #[test]
+    fn stop_after_start_erases_and_is_idempotent() {
+        // On a non-tty (this harness) start() is a no-op, so stop() must be
+        // a silent no-op too — and repeated stops stay silent. The tty path
+        // (real erase after join) is exercised by the live PTY smoke test.
+        start("test label");
+        stop();
+        stop();
+        assert!(!ACTIVE.load(Ordering::Relaxed));
     }
 }
