@@ -169,10 +169,10 @@ impl<C> Watcher<C> {
 /// for the whole run), log live vs restart-required changes, run the
 /// live-application hooks, and atomically swap into `shared`.
 ///
-/// The Command Center poller calls this with its merged document so a
+/// The CentCom poller calls this with its merged document so a
 /// centrally pushed change behaves exactly like an operator editing the file
 /// — same tiering, same side effects, same "restart required" warnings.
-/// `source` labels the log lines (e.g. "Command Center").
+/// `source` labels the log lines (e.g. "CentCom").
 pub fn apply_external_reload<C>(
     shared: &SharedConfig<C>,
     new_cfg: C,

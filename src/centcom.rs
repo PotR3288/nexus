@@ -1,9 +1,9 @@
 // Copyright (c) 2026 PotR3288
 // SPDX-License-Identifier: BSD-3-Clause
-//! Miner-side client for the Command Center service
-//! (`PotR3288/command-center`) — central config distribution + fleet status.
+//! Miner-side client for the CentCom service
+//! (`PotR3288/centcom`) — central config distribution + fleet status.
 //!
-//! A miner configured with a `[command_center]` section (address, its own
+//! A miner configured with a `[centcom]` section (address, its own
 //! id, and its per-miner token) uses this module to:
 //!
 //! - [`Client::fetch_config`] — `GET /v1/miners/{id}` returns the profile's
@@ -20,7 +20,7 @@
 //! endpoint or tunnel.
 //!
 //! [`ManagedConfig`] field names are the wire contract shared with
-//! command-center's `store.rs` (and its web UI) — keep them in lockstep when
+//! centcom's `store.rs` (and its web UI) — keep them in lockstep when
 //! extending schema v1, then bump this crate and re-pin it in both miners.
 
 use serde::{Deserialize, Serialize};
@@ -28,10 +28,10 @@ use std::fmt;
 use std::io::Read;
 use std::time::Duration;
 
-/// Managed config document served by the Command Center — schema v1, the
+/// Managed config document served by the CentCom — schema v1, the
 /// curated fleet-level subset common to xtminer and edgecase. Every field is
 /// optional: a profile may manage any subset, and miners only override
-/// fields that are present (see each miner's `command_center` module for the
+/// fields that are present (see each miner's `centcom` module for the
 /// mapping onto its own config).
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct ManagedConfig {
@@ -115,7 +115,7 @@ pub struct ManagedConfig {
     pub email_report_interval_secs: Option<u64>,
 }
 
-/// Miner → Command Center status report (POST /v1/miners/{id}/heartbeat).
+/// Miner → CentCom status report (POST /v1/miners/{id}/heartbeat).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Heartbeat {
     /// Miner binary version string.
@@ -185,7 +185,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// the next tick retries.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Miner-side client for one Command Center profile. Cheap to clone (three
+/// Miner-side client for one CentCom profile. Cheap to clone (three
 /// Strings).
 #[derive(Clone)]
 pub struct Client {
@@ -272,7 +272,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Arc;
 
-    /// Minimal single-purpose mock of the Command Center miner API: answers
+    /// Minimal single-purpose mock of the CentCom miner API: answers
     /// GET /v1/miners/{id} with a canned config doc and records POST bodies.
     fn mock_server() -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

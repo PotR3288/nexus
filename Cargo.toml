@@ -17,7 +17,7 @@ arc-swap = "1"
 # dispatcher. tiny_http version pinned to match both miners (0.12).
 tiny_http = "0.12"
 
-# Command Center miner-side client (command_center.rs): plain-HTTP only —
+# CentCom miner-side client (centcom.rs): plain-HTTP only —
 # default features off so no TLS stack is pulled into consumers that never
 # use it; the service runs on a trusted LAN over http://.
 ureq = { version = "2", default-features = false, features = ["json"] }

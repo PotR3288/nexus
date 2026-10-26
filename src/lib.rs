@@ -15,7 +15,7 @@
 //! both miners can link it.
 
 pub mod api;
-pub mod command_center;
+pub mod centcom;
 pub mod config_util;
 pub mod logging;
 pub mod notify;
