@@ -1,7 +1,8 @@
 // Copyright (c) 2026 PotR3288
 // SPDX-License-Identifier: BSD-3-Clause
 //! Miner-side client for the CentCom service
-//! (`PotR3288/centcom`) — central config distribution + fleet status.
+//! (`PotR3288/centcom`) — central config distribution + fleet status +
+//! notification emission.
 //!
 //! A miner configured with a `[centcom]` section (address, its own
 //! id, and its per-miner token) uses this module to:
@@ -11,6 +12,8 @@
 //!   `updated_at` epoch so pollers can skip unchanged documents.
 //! - [`Client::post_heartbeat`] — `POST /v1/miners/{id}/heartbeat` reports
 //!   version, uptime, and hashrate for the fleet dashboard.
+//! - [`Client::post_events`] — `POST /v1/miners/{id}/events` submits mining
+//!   events for notification dispatch by CentCom (email, Telegram, etc.).
 //!
 //! All methods are BLOCKING (ureq) — call them from a dedicated thread,
 //! never from the mining hot path. The service speaks plain HTTP on a
@@ -143,6 +146,16 @@ pub struct DeviceStat {
     pub rate: f64,
 }
 
+/// Payload for POST /v1/miners/{id}/events — a batch of unified mining events.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct EventPayload {
+    /// The miner id this batch belongs to (matches the path param).
+    pub miner_id: String,
+    /// Events in chronological order (newest last).
+    #[serde(default)]
+    pub events: Vec<crate::notify::Event>,
+}
+
 /// Response to GET /v1/miners/{id}.
 #[derive(Debug, Deserialize)]
 pub struct ConfigResponse {
@@ -254,6 +267,35 @@ impl Client {
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(())
     }
+
+    /// Submit a batch of mining events for notification dispatch by CentCom.
+    /// Events are serialized as the unified nexus vocabulary (snake_case
+    /// kinds, typed rates, etc.). Failures are non-fatal — if CentCom is
+    /// unreachable the miner keeps running; events are lost but the local
+    /// event ring still records them for the HTTP API.
+    pub fn post_events(&self, events: &[crate::notify::Event]) -> Result<(), Error> {
+        let url = format!("{}/v1/miners/{}/events", self.base_url, self.miner_id);
+        let payload = EventPayload {
+            miner_id: self.miner_id.clone(),
+            events: events.to_vec(),
+        };
+        let res = ureq::post(&url)
+            .set("Authorization", &format!("Bearer {}", self.token))
+            .timeout(HEARTBEAT_TIMEOUT)
+            .send_json(&payload)
+            .map_err(|e| match e {
+                ureq::Error::Status(code, resp) => Error::Status {
+                    code,
+                    body: response_body(resp),
+                },
+                other => Error::Http(other.to_string()),
+            })?;
+        let mut sink = Vec::new();
+        res.into_reader()
+            .read_to_end(&mut sink)
+            .map_err(|e| Error::Http(e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Best-effort extraction of an error response body (ureq keeps the response
@@ -359,6 +401,47 @@ mod tests {
                 .any(|l| l.contains("POST /v1/miners/rig-a/heartbeat")),
             "{log:?}"
         );
+    }
+
+    #[test]
+    fn post_events_submits_batched_unified_events() {
+        let (addr, seen) = mock_server();
+        let c = Client::new(&addr, "rig-b", "tok2");
+        use crate::notify::{Event, EventKind};
+        let events = vec![
+            Event::now(EventKind::MiningStarted),
+            Event::now(EventKind::SolutionAccepted)
+                .with_height(940635)
+                .with_nonce(120),
+        ];
+        c.post_events(&events).unwrap();
+        let log = seen.lock().unwrap().clone();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("POST /v1/miners/rig-b/events")),
+            "{log:?}"
+        );
+    }
+
+    #[test]
+    fn event_payload_serializes_correctly() {
+        use crate::notify::{Event, EventKind};
+        let events = vec![
+            Event::now(EventKind::MiningStarted),
+            Event::now(EventKind::SolutionAccepted)
+                .with_height(940635)
+                .with_nonce(120),
+        ];
+        let payload = EventPayload {
+            miner_id: "rig-b".to_string(),
+            events,
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert!(json.contains(r#""miner_id":"rig-b""#));
+        assert!(json.contains("mining_started"));
+        assert!(json.contains("solution_accepted"));
+        assert!(json.contains("940635"));
+        assert!(json.contains("120"));
     }
 
     #[test]

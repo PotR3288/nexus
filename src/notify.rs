@@ -503,6 +503,19 @@ impl EventLog {
         self.len() == 0
     }
 
+    /// Atomically drain all events from the ring, returning them oldest-first.
+    /// The caller posts these to CentCom; they remain in the ring for the API
+    /// surface (the push that created them is not undone). Returns an empty vec
+    /// when the buffer was already empty — no locking contention on repeated
+    /// calls.
+    pub fn drain(&self) -> Vec<Event> {
+        let mut q = self.lock();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        q.drain(..).collect()
+    }
+
     fn lock(&self) -> MutexGuard<'_, VecDeque<Event>> {
         self.events
             .lock()
