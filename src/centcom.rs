@@ -133,6 +133,12 @@ pub struct Heartbeat {
     /// Per-device breakdown (empty when the miner tracks no per-device rates).
     #[serde(default)]
     pub devices: Vec<DeviceStat>,
+    /// The work source the miner is currently mining to, as the miner
+    /// renders it (e.g. "proxy http://host:18086", "stratum pool:3110",
+    /// "node http://…"). Optional for wire compatibility with older
+    /// miners; the fleet dashboard surfaces it next to the hashrate.
+    #[serde(default)]
+    pub active_endpoint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -388,6 +394,7 @@ mod tests {
             uptime_secs: 60,
             hashrate: 4.2,
             rate_unit: "graphs/s".into(),
+            active_endpoint: Some("proxy http://127.0.0.1:18086".into()),
             devices: vec![DeviceStat {
                 id: 0,
                 name: None,
