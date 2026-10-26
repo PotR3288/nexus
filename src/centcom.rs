@@ -96,6 +96,15 @@ pub struct ManagedConfig {
     #[serde(default)]
     pub api_token: Option<String>,
 
+    // ── Node (edgecase [node]; ignored by xtminer, which mines via
+    //    proxy/stratum only) ───────────────────────────────────────────────
+    /// Base node URL (edgecase `node.base_node`, e.g. "http://127.0.0.1:18142").
+    #[serde(default)]
+    pub node_url: Option<String>,
+    /// Tari network (edgecase `node.network`, e.g. "mainnet" | "esmeralda").
+    #[serde(default)]
+    pub node_network: Option<String>,
+
     // ── Email notifications ───────────────────────────────────────────────
     #[serde(default)]
     pub email_enabled: Option<bool>,
