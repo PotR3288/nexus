@@ -17,6 +17,7 @@
 pub mod api;
 pub mod centcom;
 pub mod config_util;
+pub mod donation;
 pub mod logging;
 pub mod notify;
 pub mod onboard;
