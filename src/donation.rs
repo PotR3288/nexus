@@ -75,6 +75,41 @@ pub struct ResolveInput {
 /// Maximum rotation cycle length: a tiny fraction clamps to 1 unit in 10k.
 const MAX_CYCLE_LEN: u64 = 10_000;
 
+/// Donation recipients, hard-coded by design: the miner's operator chooses
+/// *how much* to donate (`fraction`, 0 = opt-out) but never *where it goes*,
+/// so a downstream fork cannot silently redirect the funds.
+///
+/// Split is always 50/50:
+/// - half of every donated unit goes to the xtminer/edgecase developers,
+/// - half goes to the Tari development community.
+pub const DEVELOPERS_ADDRESS: &str = "PLACEHOLDER_DEVELOPERS_ADDRESS";
+pub const COMMUNITY_ADDRESS: &str = "PLACEHOLDER_COMMUNITY_ADDRESS";
+
+/// The donation policy built from the hard-coded recipients and the
+/// operator-chosen fraction. `fraction` 0 disables donations entirely
+/// (the opt-out); values outside (0, 1] also disable — there is no
+/// fail-loud here because the addresses are compile-time constants
+/// validated by unit tests, and the operator's only knob is the share.
+pub fn builtin_config(fraction: f64) -> DonationConfig {
+    let enabled = fraction > 0.0 && fraction <= 1.0;
+    DonationConfig {
+        enabled,
+        strategy: DonationStrategy::Cycle {
+            fraction: fraction.clamp(0.0, 1.0),
+        },
+        addresses: vec![
+            WeightedAddress {
+                address: DEVELOPERS_ADDRESS.to_string(),
+                weight: 1,
+            },
+            WeightedAddress {
+                address: COMMUNITY_ADDRESS.to_string(),
+                weight: 1,
+            },
+        ],
+    }
+}
+
 /// Returns `Some(donation_address)` when a donation is due for this unit of
 /// work, `None` to use the primary wallet. Pure: same inputs, same answer.
 pub fn resolve(cfg: &DonationConfig, input: &ResolveInput) -> Option<String> {
@@ -83,14 +118,31 @@ pub fn resolve(cfg: &DonationConfig, input: &ResolveInput) -> Option<String> {
     }
     let open = match &cfg.strategy {
         DonationStrategy::Cycle { fraction } => cycle_is_open(*fraction, input.rotation),
-        DonationStrategy::Window { schedule, duration_minutes } => {
-            window_is_open(schedule, *duration_minutes, input.now)?
-        }
+        DonationStrategy::Window {
+            schedule,
+            duration_minutes,
+        } => window_is_open(schedule, *duration_minutes, input.now)?,
     };
     if !open {
         return None;
     }
-    Some(pick_address(&cfg.addresses, input.rotation))
+    // Pick the address by DONATION-SLOT index, not raw rotation: with a Cycle
+    // strategy, donation slots recur every `cycle_len` rotations, so a raw
+    // rotation % total_weight can land on the same slot parity every time
+    // (e.g. cycle_len 10, two addresses → every slot is even → the second
+    // address never gets picked). Counting elapsed donation slots makes the
+    // weighted split exact regardless of cycle length.
+    let pick_index = match &cfg.strategy {
+        DonationStrategy::Cycle { fraction } => {
+            let cycle_len = (1.0 / fraction).ceil().clamp(1.0, MAX_CYCLE_LEN as f64) as u64;
+            let open_slots = (fraction * cycle_len as f64)
+                .round()
+                .clamp(1.0, cycle_len as f64) as u64;
+            (input.rotation / cycle_len) * open_slots + (input.rotation % cycle_len).min(open_slots)
+        }
+        DonationStrategy::Window { .. } => input.rotation,
+    };
+    Some(pick_address(&cfg.addresses, pick_index))
 }
 
 /// Cycle openness: `cycle_len = ceil(1/fraction)` (clamped to
@@ -101,7 +153,9 @@ fn cycle_is_open(fraction: f64, rotation: u64) -> bool {
         return false;
     }
     let cycle_len = (1.0 / fraction).ceil().clamp(1.0, MAX_CYCLE_LEN as f64) as u64;
-    let open_slots = (fraction * cycle_len as f64).round().clamp(1.0, cycle_len as f64) as u64;
+    let open_slots = (fraction * cycle_len as f64)
+        .round()
+        .clamp(1.0, cycle_len as f64) as u64;
     rotation % cycle_len < open_slots
 }
 
