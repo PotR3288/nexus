@@ -82,8 +82,10 @@ const MAX_CYCLE_LEN: u64 = 10_000;
 /// Split is always 50/50:
 /// - half of every donated unit goes to the xtminer/edgecase developers,
 /// - half goes to the Tari development community.
-pub const DEVELOPERS_ADDRESS: &str = "PLACEHOLDER_DEVELOPERS_ADDRESS";
-pub const COMMUNITY_ADDRESS: &str = "PLACEHOLDER_COMMUNITY_ADDRESS";
+pub const DEVELOPERS_ADDRESS: &str =
+    "12PV8Y7kBKbTkLQcZuMGZxuP2fMBJ9UQFytBXYDKPMWyUVjrtuzEu2EFCXizgwhSC3XoXGb3RYHgcL56o2yPEhUfG2y";
+pub const COMMUNITY_ADDRESS: &str =
+    "12JYKMCdCPm1xZcDaWbcJCeGvQKFmiucPYn9YB6JBwFoEEVTamK3cQaZ8jDrde9nVKGvsA6KPYRzFja35n7RvrNTNEB";
 
 /// The donation policy built from the hard-coded recipients and the
 /// operator-chosen fraction. `fraction` 0 disables donations entirely

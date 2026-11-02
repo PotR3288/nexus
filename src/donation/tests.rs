@@ -299,4 +299,17 @@ fn builtin_addresses_are_valid_looking() {
     assert!(!DEVELOPERS_ADDRESS.trim().is_empty());
     assert!(!COMMUNITY_ADDRESS.trim().is_empty());
     assert_ne!(DEVELOPERS_ADDRESS, COMMUNITY_ADDRESS);
+    // Real Tari dual-address form: no placeholders, base58 charset, plausible
+    // length (85+ chars). Catches an accidental placeholder making it in.
+    for a in [DEVELOPERS_ADDRESS, COMMUNITY_ADDRESS] {
+        assert!(
+            !a.contains("PLACEHOLDER"),
+            "placeholder shipped as a real address"
+        );
+        assert!(a.len() >= 85, "address too short: {a}");
+        assert!(
+            a.chars().all(|c| c.is_ascii_alphanumeric()),
+            "non-base58 char in {a}"
+        );
+    }
 }
