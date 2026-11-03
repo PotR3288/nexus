@@ -87,6 +87,16 @@ pub const DEVELOPERS_ADDRESS: &str =
 pub const COMMUNITY_ADDRESS: &str =
     "12JYKMCdCPm1xZcDaWbcJCeGvQKFmiucPYn9YB6JBwFoEEVTamK3cQaZ8jDrde9nVKGvsA6KPYRzFja35n7RvrNTNEB";
 
+/// Human-readable donation state for startup banners and hot-reload diffs:
+/// "donating N%" when the share is effective, "off" when 0 (or out of range).
+pub fn describe_percent(percent: f64) -> String {
+    if percent > 0.0 && percent <= 100.0 {
+        format!("donating {percent}%")
+    } else {
+        "off".to_string()
+    }
+}
+
 /// The donation policy built from the hard-coded recipients and the
 /// operator-chosen fraction. `fraction` 0 disables donations entirely
 /// (the opt-out); values outside (0, 1] also disable — there is no

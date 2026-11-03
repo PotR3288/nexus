@@ -237,6 +237,15 @@ fn window_crossing_midnight_is_open_on_both_sides() {
 }
 
 #[test]
+fn describe_percent_states() {
+    assert_eq!(describe_percent(1.0), "donating 1%");
+    assert_eq!(describe_percent(12.5), "donating 12.5%");
+    assert_eq!(describe_percent(0.0), "off");
+    assert_eq!(describe_percent(-3.0), "off");
+    assert_eq!(describe_percent(150.0), "off");
+}
+
+#[test]
 fn builtin_config_zero_fraction_disables() {
     let cfg = builtin_config(0.0);
     assert!(!cfg.enabled, "0% is the opt-out — nothing may donate");
