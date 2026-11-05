@@ -361,6 +361,9 @@ pub enum EventKind {
     MinerStopped,
     /// The chain tip has not advanced for longer than the gap threshold.
     BlockGapDetected,
+    /// The miner switched into or out of a donation slot (wallet change,
+    /// typically via a boundary re-login). `detail` names the wallet.
+    DonationSwitch,
 }
 
 /// The unified, machine-readable mining event — the struct a GUI/Universe
