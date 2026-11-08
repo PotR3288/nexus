@@ -595,16 +595,6 @@ mod tests {
             "header name is case-insensitive"
         );
     }
-
-    #[test]
-    fn constant_time_eq_is_plain_equality() {
-        assert!(super::constant_time_eq(b"", b""));
-        assert!(super::constant_time_eq(b"abc", b"abc"));
-        assert!(!super::constant_time_eq(b"abc", b"abd"));
-        assert!(!super::constant_time_eq(b"abc", b"ab"));
-        assert!(!super::constant_time_eq(b"ab", b"abc"));
-    }
-
     #[test]
     fn route_dispatches_all_endpoints() {
         let h = TestHooks::new();

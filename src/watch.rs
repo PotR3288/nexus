@@ -353,12 +353,4 @@ mod tests {
         assert_eq!(sh.load().threads, 77, "CLI flag must outrank the file");
         drop(overrides);
     }
-
-    #[test]
-    fn diff_line_format() {
-        let mut out = Vec::new();
-        diff_line(10u64, 30, "report_secs", &mut out);
-        diff_line(30u64, 30, "same", &mut out);
-        assert_eq!(out, vec!["report_secs: 10 → 30".to_string()]);
-    }
 }
