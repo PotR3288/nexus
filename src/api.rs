@@ -432,7 +432,6 @@ pub fn schedule_restart_with_failure_prefix(failure_prefix: &str) {
                     .iter()
                     .map(|a| CString::new(a.clone()).unwrap())
                     .collect();
-                // execv takes a NUL-terminated list.
                 let mut ptrs: Vec<*const libc::c_char> =
                     c_args.iter().map(|a| a.as_ptr()).collect();
                 ptrs.push(std::ptr::null());
@@ -464,7 +463,8 @@ pub fn schedule_restart_with_failure_prefix(failure_prefix: &str) {
         .ok();
 }
 
-/// [`schedule_restart_with_failure_prefix`] with a bare "restart:" prefix.
+/// Convenience wrapper: [`schedule_restart_with_failure_prefix`] with a bare
+/// "restart:" prefix.
 pub fn schedule_restart() {
     schedule_restart_with_failure_prefix("restart:");
 }
@@ -497,7 +497,6 @@ pub fn log_tail_of_file(query: &str, path: &std::path::Path) -> (u16, Value) {
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let tail: Vec<&str> = content.lines().rev().take(lines).collect();
-            // Reverse back to chronological order.
             let mut out: Vec<String> = tail.into_iter().map(str::to_string).collect();
             out.reverse();
             (200, json!({"path": path.to_string_lossy(), "lines": out}))

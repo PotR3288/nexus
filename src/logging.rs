@@ -47,8 +47,6 @@ pub fn init_file_only(
     // Leak the guard: the worker thread outlives main's stack frame.
     std::mem::forget(_file_guard);
 
-    // reload::Layer::new returns (layer, handle): the layer goes into the
-    // subscriber; the handle drives live level changes from the watcher.
     let (filter_layer, filter_handle) = reload::Layer::new(initial_filter);
 
     tracing_subscriber::registry()
@@ -108,7 +106,7 @@ pub fn console_line(line: &str) {
     });
 }
 
-/// Enable Windows console VT processing (no-op off-Windows).
+/// Enable Windows console VT processing (no-op off-Windows) — see [`win_vt`].
 #[cfg(windows)]
 pub(crate) fn ensure_console_vt() {
     win_vt::enable();

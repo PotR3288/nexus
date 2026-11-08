@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! Config-file machinery shared by xtminer and edgecase.
 //!
-//! Extracted from the API-parity work both miners carry as near-copies
-//! (xtminer `564cb3c`/`12e0b0e`, edgecase `62ad490`/`ce91780`). Semantics are
+//! Semantics are
 //! frozen — they are the contract xtminer-gui and Tari Universe clients see:
 //!
 //! - **Mask token**: GET /config replaces secrets with `"***"`; a PUT carrying
@@ -122,7 +121,6 @@ pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
         && matches!(overlay, toml::Value::Array(_))
         && base.as_array().map(|a| a.len()) == overlay.as_array().map(|a| a.len());
     if both_tables {
-        // Safe: the match above guarantees both are tables.
         let (b, o) = match (base, overlay) {
             (toml::Value::Table(b), toml::Value::Table(o)) => (b, o),
             _ => unreachable!(),
@@ -142,7 +140,6 @@ pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {
         // disk — with element-wise recursion each masked cell keeps its
         // stored value, exactly like masked scalar fields. Different lengths
         // mean an actual add/remove edit and fall through to replacement.
-        // Safe: the guard above guarantees both are same-length arrays.
         let (b, o) = match (base, overlay) {
             (toml::Value::Array(b), toml::Value::Array(o)) => (b, o),
             _ => unreachable!(),

@@ -28,8 +28,7 @@
 //!
 //! xmrig's `target` field: the hex string is a 4-byte little-endian u32
 //! (`target_u32`); xmrig's share target is `u64::MAX / (u32::MAX / target_u32)`,
-//! which
-//! under the `hash < u64::MAX / difficulty` check equals pool difficulty
+//! which under the `hash < u64::MAX / difficulty` check equals pool difficulty
 //! `u32::MAX / target_u32`.
 
 use log::{debug, info, warn};

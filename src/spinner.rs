@@ -142,11 +142,9 @@ pub fn stop() {
         // takes it, and holding both would invert nothing but is needless.
         drop(handle);
         let _ = h.join();
-        // Erase the final frame AFTER the join so no late frame can land on
-        // top of it. This must NOT go through clear_current_row's callers'
-        // usual path only: ACTIVE is already false here, and a concurrent
-        // line writer may have raced ahead — clearing again under the lock
-        // is cheap and makes retirement total.
+        // Erase the final frame AFTER the join so no late frame lands on top;
+        // a concurrent line writer may have raced ahead, so clear again even
+        // though ACTIVE is already false.
         with_console(clear_current_row);
     }
 }

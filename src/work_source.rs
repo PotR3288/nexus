@@ -116,6 +116,8 @@ pub trait WorkSourceEntry: Clone + Send + Sync + 'static {
     /// that URL prefix (see [`identity_url`]).
     fn identity(&self) -> String;
     /// Full fingerprint modulo `enabled` — the hot-reload carryover key.
+    /// Excludes `enabled` (standby surgery is not a credential change) and
+    /// every field is compared — an edited wallet makes the entry unproven.
     fn reload_key(&self) -> String;
     /// Standby flag: `false` entries keep their index but are never selected.
     fn enabled(&self) -> bool;
@@ -205,7 +207,8 @@ pub struct PoolManager<E: WorkSourceEntry> {
     /// The full `[[pool]]` list in config order (disabled entries included —
     /// they occupy their index but are never selected).
     pools: Mutex<Vec<E>>,
-    /// Per-index failure/cooldown state, parallel to `pools`.
+    /// Per-index failure/cooldown state, parallel to `pools`. Lock order:
+    /// always `pools` before `candidates` — inverted order deadlocks.
     candidates: Mutex<Vec<Candidate>>,
     /// Index into `pools` of the entry currently in use (usize::MAX = none).
     active: AtomicUsize,
@@ -309,7 +312,6 @@ impl<E: WorkSourceEntry> PoolManager<E> {
         // entry keeps its verified history. `reverted` resets — selection
         // eligibility re-derives from what actually answers.
         let prev_verified: HashSet<String> = {
-            // Lock order pools → candidates, as everywhere else.
             let old_pools = self.pools.lock().unwrap();
             let candidates = self.candidates.lock().unwrap();
             pools
@@ -442,15 +444,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// drops it from the connected set, moves `active` to the fallback and
     /// returns the fallback index for the caller to try next.
     fn revert_to_verified(&self, index: usize, url: &str, fallback_index: usize) -> usize {
-        // The failed entry goes on an extended cooldown — long enough
-        // that selection keeps preferring the working fallback for a
-        // while (a short RETRY_AFTER would ping-pong: once it expires,
-        // select() re-prefers this highest-priority entry and the
-        // miner bounces dead→revert→dead every minute). The cooldown
-        // is NOT infinite so a recovered entry still gets picked up
-        // eventually (and a config reload resets all state
-        // immediately). If the user wants to force this entry back
-        // sooner they edit the config or disable the other entries.
+        // extended cooldown: see REVERT_COOLDOWN doc — prevents ping-pong
         {
             let mut candidates = self.candidates.lock().unwrap();
             candidates[index].retry_at_ms.store(
@@ -519,8 +513,6 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                 return Some(self.revert_to_verified(index, &url, fallback_index));
             }
         }
-        // Lock order: pools→candidates (everywhere-else order; replace()
-        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
         let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
@@ -552,8 +544,6 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// same index when nothing else is available; the caller should back off
     /// before retrying it, since it is now on cooldown).
     pub fn fail_immediately(&self, index: usize) -> Option<usize> {
-        // Lock order: pools→candidates (everywhere-else order; replace()
-        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
         let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
@@ -586,8 +576,6 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// accumulate, and the whole point of this method is to catch "serves
     /// work fine but cannot validate anything".
     pub fn report_share_rejection(&self, index: usize) -> Option<usize> {
-        // Lock order: pools→candidates (everywhere-else order; replace()
-        // holds them in this order, so the reverse would deadlock).
         let pools = self.pools.lock().unwrap();
         let mut candidates = self.candidates.lock().unwrap();
         if index >= pools.len() || !pools[index].enabled() {
@@ -610,11 +598,7 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             &self.active,
             &self.connected_urls,
         );
-        // Rejection bans get the LONGER cooldown: the streak persists (see
-        // rotate's note), so when this expires and selection probes the entry
-        // again, one rejected submission re-bans it at once. RETRY_AFTER
-        // would ping-pong dead→failover→dead every minute, each cycle losing
-        // a share.
+        // extended cooldown: see REJECT_COOLDOWN doc — prevents ping-pong
         candidates[index].retry_at_ms.store(
             Self::now_ms() + REJECT_COOLDOWN.as_millis() as u64,
             Ordering::Relaxed,
@@ -660,15 +644,9 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             Ordering::Relaxed,
         );
         candidates[index].consecutive_fails = 0;
-        // NOTE: `consecutive_rejects` is deliberately NOT reset here. An entry
-        // banned for share rejections keeps its streak at/above threshold:
-        // when its cooldown expires and selection probes it again, ONE more
-        // rejected submission re-bans it immediately (one lost share) instead
-        // of burning another full REJECT_THRESHOLD. The only ways back are an
-        // ACCEPTED share on this entry ([`clear_share_rejections`] — the
-        // validator demonstrably works again) or a config reload (fresh
-        // strikes). This is what keeps a broken-validator source out of
-        // rotation without ping-pong.
+        // NOTE: `consecutive_rejects` is deliberately NOT reset here — see
+        // the `consecutive_rejects` field doc (extended cooldown: see
+        // REJECT_COOLDOWN doc — prevents ping-pong).
         // Abandoned — stop advertising it (display shows "none" until a
         // success re-proves the connection).
         connected_urls.lock().unwrap().remove(&failed_url);
@@ -734,9 +712,6 @@ impl<E: WorkSourceEntry> PoolManager<E> {
                 out
             };
             if !requalified.is_empty() {
-                // Lock order: pools AFTER candidates is released
-                // (pools→candidates is the everywhere-else order; never hold
-                // both in reverse).
                 let urls: Vec<String> = {
                     let pools = self.pools.lock().unwrap();
                     requalified
@@ -886,11 +861,9 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             .collect()
     }
 
-    /// Same as [`Self::pool_identities`], but each identity is paired with the
-    /// entry's `enabled` flag. Diffing on this catches a hot-reload that ONLY
-    /// toggles `enabled` — identity deliberately excludes the flag (reload_key
-    /// carryover semantics), so an identity-only diff would silently drop an
-    /// enable/disable edit.
+    /// Identities paired with the `enabled` flag. Diffing on this catches a
+    /// hot-reload that only toggles `enabled` — identity deliberately
+    /// excludes the flag.
     pub fn pool_identity_enabled(&self) -> Vec<(String, bool)> {
         self.pools
             .lock()
@@ -1236,13 +1209,9 @@ mod tests {
 
     #[test]
     fn reverted_pool_stays_out_of_rotation_during_cooldown() {
-        // Anti-ping-pong: once a never-worked entry is reverted from, its
-        // cooldown must be LONGER than the normal failover RETRY_AFTER — with
-        // the short one, select() would re-prefer this highest-priority entry
-        // every minute and the miner would bounce dead→revert→dead. The
-        // working fallback keeps being selected for the whole window; after
-        // REVERT_COOLDOWN expires, the entry is re-qualified for ONE probe
-        // per cooldown cycle (see reverted_pool_fails_back_after_cooldown_expiry).
+        // extended cooldown: see REVERT_COOLDOWN doc — prevents ping-pong
+        // (after it expires the entry is re-qualified for ONE probe per
+        // cycle; see reverted_pool_fails_back_after_cooldown_expiry).
         let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),
@@ -1564,14 +1533,8 @@ mod tests {
 
     #[test]
     fn banned_pool_stays_out_of_rotation_and_rebans_on_one_probe() {
-        // Anti-ping-pong (the live-smoke finding): once an entry is banned
-        // for share rejections, its cooldown must be LONGER than the normal
-        // failover RETRY_AFTER — otherwise selection would re-prefer this
-        // highest-priority entry every minute and the miner would bounce
-        // dead→failover→dead, losing REJECT_THRESHOLD shares per cycle. The
-        // working fallback keeps being selected for the whole window; a
-        // config reload resets state at once (and the entry gets another
-        // chance).
+        // extended cooldown: see REJECT_COOLDOWN doc — prevents ping-pong
+        // (a config reload resets state at once).
         let manager = chain(vec![
             TestEntry::node("http://a"),
             TestEntry::node("http://b"),

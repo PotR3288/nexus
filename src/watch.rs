@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //! Config hot-reload machinery shared by xtminer and edgecase.
 //!
-//! Ported verbatim from xtminer's config_watch.rs (edgecase's copy already
-//! says "Ported from xtminer's config_watch.rs"). A watcher thread polls the
+//! A watcher thread polls the
 //! config file's mtime (no inotify dependency); on change it debounces,
 //! re-parses + validates, re-applies CLI overrides (a flag keeps winning over
 //! the file for the whole run), logs what changed live vs restart-required,
@@ -41,11 +40,6 @@ pub fn shared<C>(config: C) -> SharedConfig<C> {
     Arc::new(ArcSwap::from_pointee(config))
 }
 
-/// Result of loading configuration from a file. Kept here under a distinct
-/// name because `crate::config::ConfigLoad` in each miner is the same
-/// tri-state (see [`crate::config_util::ConfigLoad`]); the miners' own
-/// `Config::load` implementations map onto it.
-///
 /// Miner-specific reload behavior, supplied as callbacks:
 ///
 /// - `describe_live(old, new)` — human-readable summary of LIVE-applied
