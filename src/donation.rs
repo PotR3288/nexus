@@ -22,7 +22,7 @@
 //! timestamps/heights alone.
 
 use serde::{Deserialize, Serialize};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 /// One donation address with its share of the rotation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -161,7 +161,9 @@ pub fn resolve(cfg: &DonationConfig, input: &ResolveInput) -> Option<String> {
 /// [`MAX_CYCLE_LEN`]); the first `round(fraction * cycle_len)` slots of every
 /// cycle are donation slots. fraction 0 donates nothing.
 fn cycle_is_open(fraction: f64, rotation: u64) -> bool {
-    if !(fraction > 0.0) {
+    // Explicit (not `!(fraction > 0.0)`): NaN must also close the cycle —
+    // clippy's partial_cmp rewrite would let NaN through to a div-by-zero.
+    if fraction <= 0.0 || fraction.is_nan() {
         return false;
     }
     let cycle_len = (1.0 / fraction).ceil().clamp(1.0, MAX_CYCLE_LEN as f64) as u64;
@@ -185,8 +187,7 @@ fn window_is_open(schedule: &str, duration_minutes: u32, now: SystemTime) -> Opt
     let now_utc: chrono::DateTime<chrono::Utc> = now.into();
     // Scan the last 25h of occurrences (24h + slack) for one covering now.
     let horizon = now_utc - chrono::Duration::hours(25);
-    let mut upcoming = sched.after(&horizon);
-    while let Some(start) = upcoming.next() {
+    for start in sched.after(&horizon) {
         let end = start + chrono::Duration::minutes(duration_minutes as i64);
         if start <= now_utc && now_utc < end {
             return Some(true);

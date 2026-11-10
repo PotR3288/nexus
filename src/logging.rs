@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Shared tracing subscriber setup for the miners.
 //!
 //! One registry, one file fmt layer writing `logs/miner.log`, governed by a
