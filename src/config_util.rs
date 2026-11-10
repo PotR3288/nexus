@@ -12,61 +12,12 @@
 //! - **RFC 7386 nulls**: object-level `null` in a JSON body deletes the key so
 //!   Config defaults re-apply; nulls inside arrays become `""` (TOML has no
 //!   null). GET→PUT round-trips are idempotent.
-//! - **Validate before write**: the merged document is parsed into the
-//!   miner's `Config` (deny_unknown_fields) and any extra validation runs
-//!   BEFORE the on-disk file is touched; writes are atomic (temp + rename).
+//! - **Validate before write**: each miner's API handler parses the merged
+//!   document into its own `Config` (deny_unknown_fields) and runs extra
+//!   validation BEFORE touching disk, with an atomic temp+rename write —
+//!   this module supplies the merge/convert primitives that make that safe.
 
 use serde_json::Value;
-use std::path::Path;
-
-/// Outcome of loading configuration from a file (identical in both miners).
-///
-/// Distinguishes "the file is absent" from "the file exists but is broken",
-/// so the caller can decide whether a missing file is a loud warning (the
-/// default path, where running with built-in defaults is reasonable) or a
-/// hard error (an explicitly-supplied path the user expects to exist).
-#[derive(Debug)]
-pub enum ConfigLoad<T> {
-    /// The config file was found and parsed successfully.
-    Loaded(T),
-    /// The config file does not exist at the given path.
-    NotFound,
-    /// The file exists but could not be read or parsed.
-    Error(String),
-}
-
-impl<T> ConfigLoad<T> {
-    /// True when a config was loaded (used by the watcher to decide whether
-    /// to watch at all).
-    pub fn is_loaded(&self) -> bool {
-        matches!(self, ConfigLoad::Loaded(_))
-    }
-
-    /// The loaded config, if any.
-    pub fn ok(self) -> Option<T> {
-        match self {
-            ConfigLoad::Loaded(c) => Some(c),
-            _ => None,
-        }
-    }
-}
-
-/// Parse a config file of type `T` (TOML, `deny_unknown_fields`) with the
-/// tri-state semantics both miners use: absent file → `NotFound`, unreadable
-/// or unparseable file → `Error`, otherwise `Loaded`.
-pub fn load_toml_config<T: serde::de::DeserializeOwned>(path: &str) -> ConfigLoad<T> {
-    if !Path::new(path).exists() {
-        return ConfigLoad::NotFound;
-    }
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(e) => return ConfigLoad::Error(format!("Failed to read config file: {e}")),
-    };
-    match toml::from_str(&content) {
-        Ok(config) => ConfigLoad::Loaded(config),
-        Err(e) => ConfigLoad::Error(format!("Failed to parse config: {e}")),
-    }
-}
 
 /// Mask every secret before it can leave the process over loopback. `paths`
 /// are dot-separated section paths whose leaf value is either a table
@@ -215,78 +166,9 @@ pub fn delete_toml_path(v: &mut toml::Value, path: &[String]) {
     }
 }
 
-/// Parse a PUT /config body as TOML first, then JSON; JSON object-level nulls
-/// are recorded as RFC 7386 deletions and converted per the rules above.
-/// Returns `(merged_document, null_deletion_paths)` or an error message.
-pub fn parse_put_body(text: &str) -> Result<(toml::Value, Vec<Vec<String>>), String> {
-    let mut null_deletions: Vec<Vec<String>> = Vec::new();
-    let doc: toml::Value = match text.parse::<toml::Value>() {
-        Ok(v) => v,
-        Err(_) => match serde_json::from_str::<serde_json::Value>(text) {
-            Ok(jv) => {
-                collect_null_deletions(&jv, &[], &mut null_deletions);
-                json_to_toml_value(&jv)
-            }
-            Err(e) => {
-                return Err(format!("body is neither valid TOML nor JSON: {e}"));
-            }
-        },
-    };
-    Ok((doc, null_deletions))
-}
-
-/// Serialize `merged` to TOML, validate it by deserializing into `T` (the
-/// miner's `Config`, `deny_unknown_fields`), run the miner's extra
-/// validation, then atomically replace `path` (temp file in the same
-/// directory + rename). On any failure nothing is written.
-///
-/// `extra_validate` runs after the type-level parse so a bad edit can never
-/// leave an unparseable file behind (the watcher would keep the old config
-/// anyway, but then GET /config and the file would disagree).
-pub fn validate_and_write<T: serde::de::DeserializeOwned>(
-    path: &str,
-    merged: &toml::Value,
-    extra_validate: impl Fn(&T) -> Result<(), String>,
-) -> Result<(), String> {
-    // Validate the MERGED result before touching disk.
-    let cfg: T = match merged.clone().try_into() {
-        Ok(c) => c,
-        Err(e) => {
-            return Err(format!(
-                "rejected before write — invalid config after merge: {e}"
-            ))
-        }
-    };
-    extra_validate(&cfg)?;
-
-    // Canonical form, no comments (same trade-off as any programmatic
-    // rewrite; the file is the source of truth for values, not formatting).
-    let out = toml::to_string_pretty(merged)
-        .map_err(|e| format!("failed serializing merged config: {e}"))?;
-
-    // Atomic replace: temp file in the same directory + rename. The temp
-    // name derives from the target file so two configs in one directory
-    // never collide, and the pid defeats stale temp files from a previous
-    // run. The watcher's mtime poll picks it up within ~2s.
-    let dir = Path::new(path).parent().unwrap_or_else(|| Path::new("."));
-    let file_stem = Path::new(path)
-        .file_name()
-        .map(|f| f.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config".to_string());
-    let tmp = dir.join(format!(".{file_stem}.{}.tmp", std::process::id()));
-    std::fs::write(&tmp, out).map_err(|e| format!("failed writing temp config: {e}"))?;
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("failed replacing config file: {e}"));
-    }
-    log::info!("API: config PUT applied to {path} — hot-reload watcher will pick it up");
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
 
     #[test]
     fn deep_merge_preserves_mask_token_and_missing_keys() {
@@ -405,19 +287,6 @@ pass = "***"
     }
 
     #[test]
-    fn parse_put_body_accepts_toml_and_json_and_records_deletions() {
-        let (doc, dels) = parse_put_body("[mining]\nwallet = \"w\"\n").unwrap();
-        assert_eq!(doc["mining"]["wallet"], toml::Value::String("w".into()));
-        assert!(dels.is_empty());
-
-        let (doc, dels) = parse_put_body(r#"{"solver":{"ntrims":null,"threads":4}}"#).unwrap();
-        assert_eq!(doc["solver"]["threads"], toml::Value::Integer(4));
-        assert_eq!(dels, vec![vec!["solver".to_string(), "ntrims".to_string()]]);
-
-        assert!(parse_put_body("this is { not valid").is_err());
-    }
-
-    #[test]
     fn mask_secrets_masks_nonempty_and_leaves_empty() {
         let mut v = serde_json::json!({
             "pool": {"pass": "secret"},
@@ -428,69 +297,5 @@ pass = "***"
         assert_eq!(v["pool"]["pass"], "***");
         assert_eq!(v["email"]["password"], ""); // empty stays empty
         assert_eq!(v["api"]["token"], "***");
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct TestConfig {
-        #[serde(default = "default_threads")]
-        threads: i32,
-    }
-    fn default_threads() -> i32 {
-        50
-    }
-
-    #[test]
-    fn validate_and_write_rejects_bad_and_writes_good_atomically() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.toml");
-        std::fs::write(&path, "threads = 10\n").unwrap();
-
-        // Bad value → rejected, file untouched.
-        let merged: toml::Value = "threads = \"oops\"".parse().unwrap();
-        let err = validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| Ok(()))
-            .unwrap_err();
-        assert!(err.contains("rejected before write"), "{err}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "threads = 10\n");
-
-        // Extra validation can reject too.
-        let merged: toml::Value = "threads = 7".parse().unwrap();
-        let err = validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| {
-            Err("threads must be >= 10".into())
-        })
-        .unwrap_err();
-        assert!(err.contains("threads must be >= 10"), "{err}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "threads = 10\n");
-
-        // Good value → written canonically, no temp leftovers.
-        let merged: toml::Value = "threads = 20".parse().unwrap();
-        validate_and_write::<TestConfig>(path.to_str().unwrap(), &merged, |_| Ok(())).unwrap();
-        let written = std::fs::read_to_string(&path).unwrap();
-        assert!(written.contains("threads = 20"), "{written}");
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().to_string())
-            .filter(|n| n.contains(".tmp"))
-            .collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
-    }
-
-    #[test]
-    fn load_toml_config_tri_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("c.toml");
-        assert!(matches!(
-            load_toml_config::<TestConfig>(path.to_str().unwrap()),
-            ConfigLoad::NotFound
-        ));
-        std::fs::write(&path, "threads = 7\n").unwrap();
-        let loaded = load_toml_config::<TestConfig>(path.to_str().unwrap());
-        assert!(loaded.is_loaded());
-        assert_eq!(loaded.ok().unwrap().threads, 7);
-        std::fs::write(&path, "threads = \"not a number\"\n").unwrap();
-        assert!(matches!(
-            load_toml_config::<TestConfig>(path.to_str().unwrap()),
-            ConfigLoad::Error(_)
-        ));
     }
 }

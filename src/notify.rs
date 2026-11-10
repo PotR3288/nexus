@@ -4,12 +4,13 @@
 //! edgecase.
 //!
 //! xtminer and edgecase carried near-copies of this whole layer (dispatcher,
-//! Channel trait, email channel); only the `Event` vocabulary differs
-//! (xtminer: proxy/hashrate events; edgecase: node/solution events). This
-//! module therefore owns the TRANSPORT half — [`Channel`], [`Dispatcher`],
-//! the SMTP email channel, and the dispatch helpers — and each miner keeps
-//! its own `Event` enum, rendered through the generic [`EmailEvent`] adapter
-//! below.
+//! Channel trait); only the `Event` vocabulary differs (xtminer:
+//! proxy/hashrate events; edgecase: node/solution events). This module owns
+//! the TRANSPORT half — [`Channel`] + [`Dispatcher`] for future carriers
+//! (Telegram, Signal, …) — and each miner keeps its own `Event` enum,
+//! rendered through the generic [`EmailEvent`] adapter below. Miner-side
+//! email delivery was removed from both miners: fleet email lives in CentCom,
+//! which consumes the unified events these miners report.
 //!
 //! The dedup/episode state (proxy-lost markers) stays in the miners: it is
 //! event-generation policy tied to their own connection state machines.
@@ -34,13 +35,7 @@ use std::collections::VecDeque;
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lettre::{
-    message::header::{HeaderName, HeaderValue},
-    message::Message,
-    transport::smtp::authentication::Credentials,
-    AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-};
-use log::{debug, info, warn};
+use log::debug;
 
 /// What a miner's event enum must render into before the shared email
 /// channel can carry it. Both miners already have exactly these three
@@ -135,236 +130,6 @@ impl Dispatcher {
                 event.subject
             );
         }
-    }
-}
-
-/// Spawn a detached dispatch task for an async send future. When called
-/// from within a tokio runtime (the mining loop's context), the task joins
-/// that runtime; otherwise (monitor thread, signal handler) it falls back to
-/// a dedicated OS thread with a mini current-thread runtime. Panics inside
-/// the future are logged, not fatal — a notification must never take the
-/// miner down.
-pub fn spawn_dispatch<F>(fut: F)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        handle.spawn(fut);
-        return;
-    }
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("failed to build mini-runtime for notification dispatch");
-        rt.block_on(fut);
-    });
-}
-
-/// Log a delivery failure with the channel name prefix.
-pub fn log_delivery_failure<E: std::fmt::Display>(channel: &str, err: E) {
-    warn!("{} notification delivery failed: {}", channel, err);
-}
-
-/// A credential string with redacted formatting and zeroized storage.
-///
-/// Wraps a secret (today only [`EmailChannel::password`]) so it can never
-/// be printed by accident: `Debug`/`Display` render `[REDACTED]`, the value
-/// is reachable only through [`expose`](Self::expose), and the backing bytes
-/// are zeroed when the last owner drops. Cloning produces an independent
-/// copy with its own drop-zeroing — the channel clones itself per dispatch,
-/// so transient copies die (and wipe) with each send.
-#[derive(Clone)]
-pub struct SecretString {
-    inner: String,
-}
-
-impl SecretString {
-    /// Wrap a credential value.
-    pub fn new(value: impl Into<String>) -> Self {
-        Self {
-            inner: value.into(),
-        }
-    }
-
-    /// The secret value. Call only where the credential is actually used
-    /// (SMTP auth) — never log it, and prefer keeping the borrow short.
-    pub fn expose(&self) -> &str {
-        &self.inner
-    }
-
-    /// True when no credential was configured (empty = anonymous SMTP).
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
-    }
-}
-
-impl From<String> for SecretString {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<&str> for SecretString {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl std::fmt::Debug for SecretString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("SecretString").field(&"[REDACTED]").finish()
-    }
-}
-
-impl Drop for SecretString {
-    fn drop(&mut self) {
-        let mut bytes = std::mem::take(&mut self.inner).into_bytes();
-        zeroize::Zeroize::zeroize(&mut bytes);
-    }
-}
-
-/// SMTP-backed implementation of [`Channel`] (lettre, async Tokio1).
-/// All credentials are redacted in logs; the miner identity is included in
-/// every message for differentiation across instances.
-#[derive(Clone)]
-pub struct EmailChannel {
-    pub host: String,
-    pub port: u16,
-    pub from_address: String,
-    pub to_addresses: Vec<String>,
-    pub username: String,
-    /// SMTP auth password — wrapped so it redacts in formatting and its
-    /// bytes are zeroed on drop. Read via [`SecretString::expose`].
-    pub password: SecretString,
-    /// true = implicit TLS (relay), false = STARTTLS.
-    pub ssl_tls: bool,
-    /// Product prefix in the subject, e.g. "xtminer" / "edgecase".
-    pub product: String,
-}
-
-impl EmailChannel {
-    /// Build an email message from event data (pub for the miners' own
-    /// Event→EmailEvent adapters and tests).
-    pub fn build_email(&self, miner_id: &str, event: &EmailEvent) -> Result<Message, String> {
-        let subject = format!("[{}] {} — Miner {}", self.product, event.subject, miner_id);
-
-        let mut msg_builder = Message::builder()
-            .from(
-                self.from_address
-                    .parse()
-                    .map_err(|e| format!("Invalid from address: {e}"))?,
-            )
-            .raw_header(HeaderValue::new(
-                HeaderName::new_from_ascii_str("Priority"),
-                "Normal".to_string(),
-            ))
-            .subject(subject);
-
-        for addr in &self.to_addresses {
-            msg_builder = msg_builder.to(addr
-                .parse()
-                .map_err(|e| format!("Invalid to address '{addr}': {e}"))?);
-        }
-
-        msg_builder
-            .body(event.body.clone())
-            .map_err(|e| format!("Message build error: {e}"))
-    }
-
-    /// Send an email message via SMTP.
-    async fn send_message(&self, msg: Message) -> Result<(), String> {
-        let builder = if self.ssl_tls {
-            AsyncSmtpTransport::<Tokio1Executor>::relay(&self.host)
-                .map_err(|e| format!("SMTP relay error: {e}"))?
-                .port(self.port)
-        } else {
-            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&self.host)
-                .map_err(|e| format!("SMTP STARTTLS relay error: {e}"))?
-                .port(self.port)
-        };
-
-        let builder = if !self.username.is_empty() && !self.password.is_empty() {
-            builder.credentials(Credentials::new(
-                self.username.clone(),
-                self.password.expose().to_string(),
-            ))
-        } else {
-            builder
-        };
-
-        let transport = builder.build();
-        match transport.send(msg).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("SMTP send failed: {e}")),
-        }
-    }
-}
-
-impl Channel for EmailChannel {
-    fn name(&self) -> &'static str {
-        "email"
-    }
-
-    /// Render the event into an email and hand it to the async dispatch
-    /// helper. Never blocks the caller.
-    fn deliver(&self, event: &EmailEvent, miner_id: &str) {
-        let this = self.clone();
-        let miner_id = miner_id.to_string();
-        let event = event.clone();
-
-        spawn_dispatch(async move {
-            match this.build_email(&miner_id, &event) {
-                Ok(msg) => {
-                    if let Err(e) = this.send_message(msg).await {
-                        log_delivery_failure("email", e);
-                    } else {
-                        info!(
-                            "Email notification sent: Miner {} — {}",
-                            miner_id, event.subject
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!("Could not build email notification: {e}");
-                }
-            }
-        });
-    }
-
-    /// Deliver synchronously: run the same send future to completion on a
-    /// dedicated thread and wait for it. Used for MinerStopped — the process
-    /// can exit immediately after, and a detached dispatch task would be
-    /// killed before the SMTP exchange finishes.
-    fn deliver_blocking(&self, event: &EmailEvent, miner_id: &str) {
-        let this = self.clone();
-        let miner_id = miner_id.to_string();
-        let event = event.clone();
-        let handle = std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to build mini-runtime for blocking notification");
-            rt.block_on(async move {
-                match this.build_email(&miner_id, &event) {
-                    Ok(msg) => {
-                        if let Err(e) = this.send_message(msg).await {
-                            log_delivery_failure("email", e);
-                        } else {
-                            info!(
-                                "Email notification sent (blocking): Miner {} — {}",
-                                miner_id, event.subject
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Could not build email notification: {e}");
-                    }
-                }
-            });
-        });
-        // Bounded wait: deliver on a best-effort basis if SMTP stalls.
-        let _ = handle.join();
     }
 }
 
@@ -662,62 +427,6 @@ mod notify_event_tests {
 mod tests {
     use super::*;
     use std::sync::Arc;
-
-    fn channel(product: &str) -> EmailChannel {
-        EmailChannel {
-            host: "smtp.test.com".into(),
-            port: 587,
-            from_address: "miner@test.com".into(),
-            to_addresses: vec!["admin@test.com".into()],
-            username: String::new(),
-            password: SecretString::new(""),
-            ssl_tls: false,
-            product: product.into(),
-        }
-    }
-
-    #[test]
-    fn build_email_includes_product_subject_and_miner_id() {
-        let ch = channel("xtminer");
-        let ev = EmailEvent {
-            subject: "Block Accepted".into(),
-            body: "body text".into(),
-        };
-        let msg = ch.build_email("192.168.1.100", &ev).unwrap();
-        let subject = msg.headers().get_raw("Subject").unwrap_or("").to_string();
-        assert!(subject.contains("[xtminer]"), "{subject}");
-        assert!(subject.contains("Block Accepted"), "{subject}");
-        assert!(subject.contains("192.168.1.100"), "{subject}");
-    }
-
-    #[test]
-    fn build_email_rejects_bad_addresses() {
-        let mut ch = channel("edgecase");
-        ch.from_address = "not-an-address".into();
-        let ev = EmailEvent {
-            subject: "s".into(),
-            body: "b".into(),
-        };
-        assert!(ch.build_email("m", &ev).is_err());
-
-        let mut ch2 = channel("edgecase");
-        ch2.to_addresses = vec!["also-bad".into()];
-        assert!(ch2.build_email("m", &ev).is_err());
-    }
-
-    #[test]
-    fn secret_string_redacts_debug_and_exposes_value() {
-        let s = SecretString::from("hunter2");
-        assert_eq!(s.expose(), "hunter2");
-        assert!(!s.is_empty());
-        // Debug must never carry the value.
-        let dbg = format!("{s:?}");
-        assert!(dbg.contains("[REDACTED]"), "{dbg}");
-        assert!(!dbg.contains("hunter2"), "{dbg}");
-
-        let empty = SecretString::new(String::new());
-        assert!(empty.is_empty());
-    }
 
     #[test]
     fn dispatcher_fans_out_to_all_channels() {

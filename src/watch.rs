@@ -198,8 +198,8 @@ pub fn apply_external_reload<C>(
 /// - `path` — the config file to watch.
 /// - `loader` — parse the file into a fresh `C` (`Err(LoadError::NotFound)`
 ///   when the file is missing; `Err(LoadError::Parse)` when unparseable).
-///   Use [`crate::config_util::load_toml_config`] to get the tri-state
-///   mapping both miners use.
+///   Each miner supplies its own loader closure wrapping its local config
+///   type with this same tri-state mapping.
 /// - `apply_overrides` — re-apply CLI flags onto each freshly parsed config.
 /// - `hooks` — miner-specific tiering + live-application callbacks.
 pub fn spawn_watcher<C>(
@@ -287,13 +287,14 @@ mod tests {
     }
 
     fn loader() -> Loader<TestConfig> {
-        Arc::new(
-            |p: &str| match crate::config_util::load_toml_config::<TestConfig>(p) {
-                crate::config_util::ConfigLoad::Loaded(c) => Ok(c),
-                crate::config_util::ConfigLoad::NotFound => Err(LoadError::NotFound),
-                crate::config_util::ConfigLoad::Error(e) => Err(LoadError::Parse(e)),
-            },
-        )
+        Arc::new(|p: &str| {
+            if !std::path::Path::new(p).exists() {
+                return Err(LoadError::NotFound);
+            }
+            let content = std::fs::read_to_string(p)
+                .map_err(|e| LoadError::Parse(format!("Failed to read config file: {e}")))?;
+            toml::from_str::<TestConfig>(&content).map_err(|e| LoadError::Parse(e.to_string()))
+        })
     }
 
     fn hooks() -> ReloadHooks<TestConfig> {

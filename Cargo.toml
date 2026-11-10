@@ -17,8 +17,8 @@ arc-swap = "1"
 cron = "0.12"
 chrono = "0.4"
 
-# HTTP client/server support for the API server skeleton and the SMTP
-# dispatcher. tiny_http version pinned to match both miners (0.12).
+# HTTP client/server support for the API server skeleton.
+# tiny_http version pinned to match both miners (0.12).
 tiny_http = "0.12"
 
 # CentCom miner-side client (centcom.rs): plain-HTTP only —
@@ -35,12 +35,6 @@ log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
-# Email notifications (SMTP) — the shared notification channel.
-lettre = { version = "0.11", default-features = false, features = ["rustls-tls", "smtp-transport", "builder", "tokio1-rustls-tls"] }
-
-# SecretString (notify.rs): zeroizes credential bytes on drop.
-zeroize = "1"
-tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 PotR3288
 // SPDX-License-Identifier: BSD-3-Clause
-//! Monero-dialect stratum framing core shared by xtminer and edgecase.
+//! Monero-dialect stratum framing core — the shared protocol layer for all
+//! miners in this fleet.
 //!
 //! Both miners speak the Monero pool protocol (the dialect unmodified xmrig
 //! speaks — pools like Kryptex's `xtm-rx-*` / C29 `xtm-*` servers) and both
@@ -8,6 +9,16 @@
 //! notification tolerance, a reader loop doing job pushes + id-correlated
 //! submit replies + keepalives (with disable-on-unknown-method, learned from
 //! LuckyPool/snipanet), and xmrig's `target`→difficulty mapping.
+//!
+//! **Shared-core direction.** This module is deliberately algorithm-agnostic:
+//! the only per-algorithm seams are [`ParseFn`] / [`JobParser`] (raw job JSON
+//! → the miner's prepared-job type) plus `nonce_width`. A future miner for a
+//! new algorithm implements its job codec and reuses the entire session
+//! machinery — no own stratum implementation. Today xtminer is the only full
+//! consumer: edgecase uses just [`login_string`], because its tokio-based
+//! pool client (`edgecase/src/pool.rs`) predates this extraction. Migrating
+//! it requires an async (tokio-native) session variant of [`Session`] — filed
+//! as future work, not part of the current surface.
 //!
 //! What is shared here is the PROTOCOL layer. What stays in each miner is
 //! the mining integration (job execution, dataset management, failover
@@ -286,10 +297,13 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// Parse a raw job into the miner's prepared-job type. Implemented by each
-/// miner (blob validation, nonce layout and difficulty semantics live with
-/// the algorithm); malformed jobs are skipped by the reader loop, never
-/// fatal.
+/// Parse a raw job into the miner's prepared-job type. This is the designed
+/// extension point for per-algorithm job codecs: blob validation, nonce
+/// layout and difficulty semantics live with the algorithm, so each miner
+/// (and any future one) supplies its own implementation while reusing the
+/// shared session machinery around it. Malformed jobs are skipped by the
+/// reader loop, never fatal. (xtminer currently passes an equivalent closure
+/// via [`ParseFn`] directly.)
 pub trait JobParser<J>: Send + Sync {
     fn parse(&self, raw: &Value, nonce_width: u8) -> Result<J, String>;
 }
