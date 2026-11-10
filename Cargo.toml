@@ -37,6 +37,9 @@ tracing-appender = "0.2"
 
 # Email notifications (SMTP) — the shared notification channel.
 lettre = { version = "0.11", default-features = false, features = ["rustls-tls", "smtp-transport", "builder", "tokio1-rustls-tls"] }
+
+# SecretString (notify.rs): zeroizes credential bytes on drop.
+zeroize = "1"
 tokio = { version = "1", features = ["rt", "macros", "time"] }
 
 [dev-dependencies]

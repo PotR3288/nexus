@@ -166,6 +166,64 @@ pub fn log_delivery_failure<E: std::fmt::Display>(channel: &str, err: E) {
     warn!("{} notification delivery failed: {}", channel, err);
 }
 
+/// A credential string with redacted formatting and zeroized storage.
+///
+/// Wraps a secret (today only [`EmailChannel::password`]) so it can never
+/// be printed by accident: `Debug`/`Display` render `[REDACTED]`, the value
+/// is reachable only through [`expose`](Self::expose), and the backing bytes
+/// are zeroed when the last owner drops. Cloning produces an independent
+/// copy with its own drop-zeroing — the channel clones itself per dispatch,
+/// so transient copies die (and wipe) with each send.
+#[derive(Clone)]
+pub struct SecretString {
+    inner: String,
+}
+
+impl SecretString {
+    /// Wrap a credential value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self {
+            inner: value.into(),
+        }
+    }
+
+    /// The secret value. Call only where the credential is actually used
+    /// (SMTP auth) — never log it, and prefer keeping the borrow short.
+    pub fn expose(&self) -> &str {
+        &self.inner
+    }
+
+    /// True when no credential was configured (empty = anonymous SMTP).
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SecretString").field(&"[REDACTED]").finish()
+    }
+}
+
+impl Drop for SecretString {
+    fn drop(&mut self) {
+        let mut bytes = std::mem::take(&mut self.inner).into_bytes();
+        zeroize::Zeroize::zeroize(&mut bytes);
+    }
+}
+
 /// SMTP-backed implementation of [`Channel`] (lettre, async Tokio1).
 /// All credentials are redacted in logs; the miner identity is included in
 /// every message for differentiation across instances.
@@ -176,7 +234,9 @@ pub struct EmailChannel {
     pub from_address: String,
     pub to_addresses: Vec<String>,
     pub username: String,
-    pub password: String,
+    /// SMTP auth password — wrapped so it redacts in formatting and its
+    /// bytes are zeroed on drop. Read via [`SecretString::expose`].
+    pub password: SecretString,
     /// true = implicit TLS (relay), false = STARTTLS.
     pub ssl_tls: bool,
     /// Product prefix in the subject, e.g. "xtminer" / "edgecase".
@@ -227,7 +287,7 @@ impl EmailChannel {
         let builder = if !self.username.is_empty() && !self.password.is_empty() {
             builder.credentials(Credentials::new(
                 self.username.clone(),
-                self.password.clone(),
+                self.password.expose().to_string(),
             ))
         } else {
             builder
@@ -610,7 +670,7 @@ mod tests {
             from_address: "miner@test.com".into(),
             to_addresses: vec!["admin@test.com".into()],
             username: String::new(),
-            password: String::new(),
+            password: SecretString::new(""),
             ssl_tls: false,
             product: product.into(),
         }
@@ -643,6 +703,20 @@ mod tests {
         let mut ch2 = channel("edgecase");
         ch2.to_addresses = vec!["also-bad".into()];
         assert!(ch2.build_email("m", &ev).is_err());
+    }
+
+    #[test]
+    fn secret_string_redacts_debug_and_exposes_value() {
+        let s = SecretString::from("hunter2");
+        assert_eq!(s.expose(), "hunter2");
+        assert!(!s.is_empty());
+        // Debug must never carry the value.
+        let dbg = format!("{s:?}");
+        assert!(dbg.contains("[REDACTED]"), "{dbg}");
+        assert!(!dbg.contains("hunter2"), "{dbg}");
+
+        let empty = SecretString::new(String::new());
+        assert!(empty.is_empty());
     }
 
     #[test]
