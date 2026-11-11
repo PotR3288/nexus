@@ -849,6 +849,15 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             .count()
     }
 
+    /// Snapshot of ALL entries in config order (enabled and disabled) — owned
+    /// clones. For consumers that must pick an entry by a criterion the
+    /// manager itself does not know (e.g. xtminer's donation-pool routing
+    /// picks the first chain entry a donation address can log in on) without
+    /// duplicating the manager's list.
+    pub fn entries(&self) -> Vec<E> {
+        self.pools.lock().unwrap().clone()
+    }
+
     /// Identities of ALL entries in config order (enabled and disabled) —
     /// lets consumers diff the live chain against a hot-reloaded one without
     /// exposing the entries themselves.
