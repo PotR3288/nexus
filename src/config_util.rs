@@ -16,8 +16,55 @@
 //!   document into its own `Config` (deny_unknown_fields) and runs extra
 //!   validation BEFORE touching disk, with an atomic temp+rename write —
 //!   this module supplies the merge/convert primitives that make that safe.
+//! - **File loading**: [`load_toml_file`] is the shared startup/hot-reload
+//!   file loader behind both miners' `Config::load` wrappers (the tri-state
+//!   [`LoadResult`] distinguishes "absent" from "broken").
 
+use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::path::Path;
+
+/// Outcome of loading a config file from disk. Distinguishes "the file is
+/// absent" (the caller decides whether that's fatal or a "run with defaults"
+/// case) from "it exists but is broken" (always a hard error). Shared by
+/// xtminer and edgecase — each miner aliases it for its own `Config` type.
+#[derive(Debug)]
+pub enum LoadResult<T> {
+    /// The file was found and parsed successfully.
+    Loaded(T),
+    /// No config file exists at the given path.
+    NotFound,
+    /// The file exists but could not be read or parsed.
+    Error(String),
+}
+
+/// Load a TOML config of type `T` from `path`.
+///
+/// Returns [`LoadResult::NotFound`] when the file is absent (the caller
+/// decides whether that's fatal or a "run with defaults" case) and
+/// [`LoadResult::Error`] when it exists but cannot be read or parsed.
+/// `post_parse_hook` runs after a successful parse, before the value is
+/// returned — per-miner fixups such as edgecase resolving its relative
+/// solver path to an absolute one; xtminer passes an empty hook.
+pub fn load_toml_file<T: DeserializeOwned>(
+    path: &str,
+    post_parse_hook: impl FnOnce(&mut T),
+) -> LoadResult<T> {
+    if !Path::new(path).exists() {
+        return LoadResult::NotFound;
+    }
+    let file_content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) => return LoadResult::Error(format!("Failed to read config file: {e}")),
+    };
+    match toml::from_str(&file_content) {
+        Ok(mut value) => {
+            post_parse_hook(&mut value);
+            LoadResult::Loaded(value)
+        }
+        Err(e) => LoadResult::Error(format!("Failed to parse config: {e}")),
+    }
+}
 
 /// Mask every secret before it can leave the process over loopback. `paths`
 /// are dot-separated section paths whose leaf value is either a table
@@ -297,5 +344,64 @@ pass = "***"
         assert_eq!(v["pool"]["pass"], "***");
         assert_eq!(v["email"]["password"], ""); // empty stays empty
         assert_eq!(v["api"]["token"], "***");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct TestDoc {
+        #[serde(default)]
+        value: u32,
+        /// Set by the post-parse hook — proves the hook ran before return.
+        #[serde(skip_deserializing, default)]
+        hooked: bool,
+    }
+
+    fn hook(doc: &mut TestDoc) {
+        doc.hooked = true;
+    }
+
+    #[test]
+    fn load_toml_file_returns_not_found_for_absent_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.toml");
+        match load_toml_file::<TestDoc>(missing.to_str().unwrap(), hook) {
+            LoadResult::NotFound => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_toml_file_parses_and_runs_post_parse_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "value = 42\n").unwrap();
+        match load_toml_file::<TestDoc>(path.to_str().unwrap(), hook) {
+            LoadResult::Loaded(doc) => {
+                assert_eq!(doc.value, 42);
+                assert!(doc.hooked, "post-parse hook must run before return");
+            }
+            other => panic!("expected Loaded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_toml_file_reports_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "value = \"\n").unwrap();
+        match load_toml_file::<TestDoc>(path.to_str().unwrap(), hook) {
+            LoadResult::Error(e) => assert!(e.starts_with("Failed to parse config"), "{e}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_toml_file_reports_read_errors() {
+        // A directory exists but cannot be read as a file — the read-error
+        // arm (distinct from NotFound).
+        let dir = tempfile::tempdir().unwrap();
+        match load_toml_file::<TestDoc>(dir.path().to_str().unwrap(), hook) {
+            LoadResult::Error(e) => assert!(e.starts_with("Failed to read config file"), "{e}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }
