@@ -326,10 +326,11 @@ pub type ParseFn<J> = Arc<dyn Fn(&Value, u8) -> Result<J, String> + Send + Sync>
 pub struct ReaderHooks<J> {
     /// Parse a raw job (login job or `job` push) into the miner's type.
     pub parse: ParseFn<J>,
-    /// A share was ACCEPTED (counter already incremented). Reset rejection
-    /// streaks here (an accepted share proves the pool's validation path
-    /// works — sporadic rejections must not accumulate toward failover).
-    pub on_share_accepted: Arc<dyn Fn() + Send + Sync>,
+    /// A share was ACCEPTED (counter already incremented). Receives the
+    /// pool's full reply frame (result object). Reset rejection streaks
+    /// here (an accepted share proves the pool's validation path works —
+    /// sporadic rejections must not accumulate toward failover).
+    pub on_share_accepted: Arc<dyn Fn(&Value) + Send + Sync>,
     /// A share was REJECTED (counter already incremented). Count
     /// consecutive-rejection failover strikes here.
     pub on_share_rejected: Arc<dyn Fn(&str) + Send + Sync>,
@@ -344,7 +345,7 @@ impl<J> ReaderHooks<J> {
     pub fn new(parse: ParseFn<J>) -> Self {
         Self {
             parse,
-            on_share_accepted: Arc::new(|| {}),
+            on_share_accepted: Arc::new(|_: &Value| {}),
             on_share_rejected: Arc::new(|_| {}),
             on_nonsubmit_error: Arc::new(|_| {}),
             on_job_installed: Arc::new(|_| {}),
@@ -690,9 +691,13 @@ fn run_reader_loop<J: Clone>(
             continue;
         }
         if is_submit_reply {
-            debug!("Share accepted: {msg}");
+            // info (not debug): an accepted share is the miner's core health
+            // signal and must be visible at the default log level — a
+            // "Share submitted!" line with no verdict line after it reads
+            // like a lost reply.
+            info!("Share accepted");
             ctx.shares_good.fetch_add(1, Ordering::Relaxed);
-            (ctx.hooks.on_share_accepted)();
+            (ctx.hooks.on_share_accepted)(&msg);
         } else {
             debug!("Stratum response: {msg}");
         }
@@ -825,7 +830,7 @@ mod tests {
             on_share_accepted: {
                 let a = Arc::clone(&accepted);
                 let _ = &shares_good;
-                Arc::new(move || {
+                Arc::new(move |_reply: &Value| {
                     a.fetch_add(1, Ordering::Relaxed);
                 })
             },
