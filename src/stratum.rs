@@ -15,10 +15,9 @@
 //! → the miner's prepared-job type) plus `nonce_width`. A future miner for a
 //! new algorithm implements its job codec and reuses the entire session
 //! machinery — no own stratum implementation. Today xtminer is the only full
-//! consumer: edgecase uses just [`login_string`], because its tokio-based
-//! pool client (`edgecase/src/pool.rs`) predates this extraction. Migrating
-//! it requires an async (tokio-native) session variant of [`Session`] — filed
-//! as future work, not part of the current surface.
+//! consumer of this sync module; edgecase's tokio pool client
+//! (`edgecase/src/pool.rs`) already runs on the async core in
+//! [`crate::stratum_async`] and pulls just [`login_string`] from here.
 //!
 //! What is shared here is the PROTOCOL layer. What stays in each miner is
 //! the mining integration (job execution, dataset management, failover

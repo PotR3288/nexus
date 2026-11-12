@@ -1,3 +1,5 @@
+// Copyright (c) 2026 PotR3288
+// SPDX-License-Identifier: BSD-3-Clause
 //! Async stratum session core (`feature = "tokio"`, off by default).
 //!
 //! Generic machinery shared with edgecase's C29 pool client — the bounded

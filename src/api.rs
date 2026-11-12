@@ -484,8 +484,8 @@ pub fn events_limit(query: &str) -> usize {
 
 /// Tail of a log file for the GUI log pane (xtminer's /log semantics):
 /// `{"path": …, "lines": […]}`, last N lines in chronological order, N
-/// clamped to [50, 2000] with default 500. Reading on each request is fine —
-/// the GUI polls at most once a second and N is small.
+/// clamped to [50, 2000] with default 500. Only the tail is read — an
+/// unbounded log must not be loaded whole on every poll (see [`tail_lines`]).
 pub fn log_tail_of_file(query: &str, path: &std::path::Path) -> (u16, Value) {
     let lines = query
         .split('&')
@@ -494,17 +494,44 @@ pub fn log_tail_of_file(query: &str, path: &std::path::Path) -> (u16, Value) {
         .unwrap_or(500)
         .clamp(50, 2000);
 
-    match std::fs::read_to_string(path) {
-        Ok(content) => {
-            let tail: Vec<&str> = content.lines().rev().take(lines).collect();
-            let mut out: Vec<String> = tail.into_iter().map(str::to_string).collect();
-            out.reverse();
-            (200, json!({"path": path.to_string_lossy(), "lines": out}))
-        }
+    match tail_lines(path, lines) {
+        Ok(out) => (200, json!({"path": path.to_string_lossy(), "lines": out})),
         Err(e) => (
             500,
             json!({"error": {"code": 500, "message": format!("log file unreadable: {e}")}}),
         ),
+    }
+}
+
+/// Read the last `n` lines of a file WITHOUT loading it whole — an unbounded
+/// log would otherwise be read in full on every GUI poll. Grows a backward
+/// window from EOF until it holds `n + 1` newline boundaries (the extra one
+/// delimits a possibly-partial leading line), so exactly the last `n` complete
+/// lines are returned, chronological order. Cost is O(n · avg_line_len), not
+/// O(file size).
+fn tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    const CHUNK: u64 = 8 * 1024;
+    let file_end = len;
+    let mut start = file_end.saturating_sub(CHUNK);
+    loop {
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = vec![0u8; (file_end - start) as usize];
+        f.read_exact(&mut buf)?;
+        // Enough newlines to delimit `n` complete lines? Or did we reach EOF?
+        let newlines = buf.iter().filter(|&&b| b == b'\n').count();
+        if newlines > n || start == 0 {
+            let text = std::str::from_utf8(&buf)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+            let tail: Vec<String> = text.lines().rev().take(n).map(str::to_string).collect();
+            return Ok(tail.into_iter().rev().collect());
+        }
+        start = start.saturating_sub(CHUNK); // grow the window backward, re-read a larger range
     }
 }
 

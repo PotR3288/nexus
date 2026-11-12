@@ -244,12 +244,6 @@ where
     )
 }
 
-/// True when two floats differ by more than epsilon (used by both miners'
-/// describe functions for threshold-style fields).
-pub fn f64_changed(a: f64, b: f64) -> bool {
-    (a - b).abs() > f64::EPSILON
-}
-
 /// `{name}: {old} → {new}` when different (the shared diff-line format).
 pub fn diff_line<T: PartialEq + std::fmt::Display>(
     old: T,
