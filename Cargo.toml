@@ -35,6 +35,13 @@ log = "0.4"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 
+# Async stratum session core (stratum_async) — OPTIONAL, off by default so
+# sync-only consumers (xtminer) see no tokio in their dep graph. Enabled
+# explicitly by async consumers (edgecase).
+tokio = { version = "1", features = ["rt", "macros", "time", "net", "io-util", "sync"], optional = true }
+
+[features]
+tokio = ["dep:tokio"]
 
 [dev-dependencies]
 tempfile = "3"

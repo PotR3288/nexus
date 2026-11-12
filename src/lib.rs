@@ -23,5 +23,7 @@ pub mod notify;
 pub mod onboard;
 pub mod spinner;
 pub mod stratum;
+#[cfg(feature = "tokio")]
+pub mod stratum_async;
 pub mod watch;
 pub mod work_source;
