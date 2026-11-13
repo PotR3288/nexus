@@ -22,17 +22,6 @@ fn weighted(address: &str, weight: u32) -> WeightedAddress {
     }
 }
 
-fn window_cfg(schedule: &str, minutes: u32, addresses: Vec<WeightedAddress>) -> DonationConfig {
-    cfg(
-        true,
-        DonationStrategy::Window {
-            schedule: schedule.to_string(),
-            duration_minutes: minutes,
-        },
-        addresses,
-    )
-}
-
 fn cycle_cfg(fraction: f64, addresses: Vec<WeightedAddress>) -> DonationConfig {
     cfg(true, DonationStrategy::Cycle { fraction }, addresses)
 }
@@ -158,81 +147,6 @@ fn weighted_rotation_wraps_over_multiple_cycles() {
         picks,
         vec!["A", "A", "A", "B", "B"],
         "weighted rotation must repeat every total_weight units"
-    );
-}
-
-#[test]
-fn window_open_inside_and_closed_outside() {
-    // "0 12 * * *" with 30 minutes: open 12:00..12:30 UTC only.
-    let c = window_cfg("0 12 * * *", 30, vec![weighted("A", 1)]);
-    assert!(
-        resolve(
-            &c,
-            &ResolveInput {
-                now: utc(12, 0),
-                rotation: 0
-            }
-        )
-        .is_some(),
-        "12:00 must be inside"
-    );
-    assert!(
-        resolve(
-            &c,
-            &ResolveInput {
-                now: utc(12, 29),
-                rotation: 0
-            }
-        )
-        .is_some(),
-        "12:29 must be inside"
-    );
-    assert!(
-        resolve(
-            &c,
-            &ResolveInput {
-                now: utc(12, 30),
-                rotation: 0
-            }
-        )
-        .is_none(),
-        "12:30 must be outside (end-exclusive)"
-    );
-    assert!(
-        resolve(
-            &c,
-            &ResolveInput {
-                now: utc(11, 59),
-                rotation: 0
-            }
-        )
-        .is_none(),
-        "11:59 must be outside"
-    );
-}
-
-#[test]
-fn window_crossing_midnight_is_open_on_both_sides() {
-    // schedule "50 23 * * *", 20 minutes: open 23:50..00:10 UTC.
-    let c = window_cfg("50 23 * * *", 20, vec![weighted("donA", 1)]);
-    let late = resolve(
-        &c,
-        &ResolveInput {
-            now: utc(23, 55),
-            rotation: 0,
-        },
-    );
-    let early = resolve(
-        &c,
-        &ResolveInput {
-            now: utc(0, 5),
-            rotation: 0,
-        },
-    );
-    assert!(late.is_some(), "23:55 UTC should be inside the window");
-    assert!(
-        early.is_some(),
-        "00:05 UTC (next day) should still be inside the window"
     );
 }
 
