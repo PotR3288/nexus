@@ -38,8 +38,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::debug;
 
 /// What a miner's event enum must render into before the shared email
-/// channel can carry it. Both miners already have exactly these three
-/// strings per event (subject prefix, subject body, plain-text body).
+/// channel can carry it: subject (WITHOUT the product/miner prefix — the
+/// channel adds that from `EmailChannel::product` and the miner id) and a
+/// plain-text body.
 #[derive(Debug, Clone)]
 pub struct EmailEvent {
     /// Plain subject body, e.g. "Block Accepted" (no miner/product prefix).
@@ -62,11 +63,13 @@ pub trait Channel: Send + Sync {
     /// logged by the dispatcher and never fatal.
     fn deliver(&self, event: &EmailEvent, miner_id: &str);
 
-    /// Deliver one event synchronously, blocking until the send completes
-    /// (bounded by a timeout inside the carrier). Used for shutdown-time
-    /// events (MinerStopped) that must actually leave before the process
-    /// exits — detached dispatch threads would be killed by `process::exit`.
-    /// Default: fall back to fire-and-forget.
+    /// Deliver one event synchronously. Used for shutdown-time events
+    /// (MinerStopped) that must actually leave before the process exits —
+    /// detached dispatch threads would be killed by `process::exit`. The
+    /// DEFAULT implementation delegates to [`Channel::deliver`]
+    /// (fire-and-forget); a carrier that truly blocks must document the
+    /// bound on its wait (unbounded waits can hang the shutdown path on a
+    /// stalled remote).
     fn deliver_blocking(&self, event: &EmailEvent, miner_id: &str) {
         self.deliver(event, miner_id);
     }
@@ -331,11 +334,12 @@ impl EventLog {
         self.len() == 0
     }
 
-    /// Atomically drain all events from the ring, returning them oldest-first.
-    /// The caller posts these to CentCom; they remain in the ring for the API
-    /// surface (the push that created them is not undone). Returns an empty vec
-    /// when the buffer was already empty — no locking contention on repeated
-    /// calls.
+    /// Atomically drain all events from the ring (they are REMOVED — the ring
+    /// is left empty), returning them oldest-first. The caller is expected to
+    /// retain them client-side if it needs a retry (xtminer's CentCom poster
+    /// keeps a pending buffer on a failed post); an /events surface reading
+    /// the ring after a drain sees only events pushed since the drain.
+    /// Takes the mutex on every call, including when the buffer is empty.
     pub fn drain(&self) -> Vec<Event> {
         let mut q = self.lock();
         if q.is_empty() {

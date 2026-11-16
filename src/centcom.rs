@@ -209,8 +209,8 @@ impl std::error::Error for Error {}
 
 /// Fetch timeout: startup fetches may cross a slow LAN hop; keep it bounded.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-/// Heartbeat timeout: status POSTs must never hold up their thread long —
-/// the next tick retries.
+/// Heartbeat/event-batch timeout: status and event POSTs must never hold up
+/// their thread long — the next tick retries.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Miner-side client for one CentCom profile. Cheap to clone (three

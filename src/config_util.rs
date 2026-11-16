@@ -7,8 +7,10 @@
 //!
 //! - **Mask token**: GET /config replaces secrets with `"***"`; a PUT carrying
 //!   `"***"` means "unchanged" and never clobbers the real value on disk.
-//! - **Deep merge**: tables merge key-by-key; scalars and arrays replace
-//!   wholesale (send the full `[[pool]]` list, not a fragment).
+//! - **Deep merge**: tables merge key-by-key; scalars replace wholesale;
+//!   arrays of EQUAL length merge element-wise (masked round-trip safety —
+//!   each masked cell keeps its stored value), different-length arrays
+//!   replace wholesale (send the full `[[pool]]` list on add/remove).
 //! - **RFC 7386 nulls**: object-level `null` in a JSON body deletes the key so
 //!   Config defaults re-apply; nulls inside arrays become `""` (TOML has no
 //!   null). GET→PUT round-trips are idempotent.
@@ -108,8 +110,10 @@ pub fn mask_secrets(v: &mut Value, secrets: &[(&str, &str)]) {
     }
 }
 
-/// Deep-merge `overlay` into `base`: tables merge key-by-key, everything else
-/// (scalars, arrays) is replaced wholesale. The literal string `"***"` — the
+/// Deep-merge `overlay` into `base`: tables merge key-by-key; scalars are
+/// replaced wholesale; arrays of EQUAL length merge element-wise (masked
+/// round-trip safety), different-length arrays are replaced wholesale. The
+/// literal string `"***"` — the
 /// GET /config mask token — never overwrites a real value, so masked
 /// round-trips can't clobber secrets.
 pub fn deep_merge_toml(base: &mut toml::Value, overlay: &toml::Value) {

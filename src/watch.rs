@@ -78,7 +78,10 @@ struct Watcher<C> {
     last_mtime_ms: AtomicU64,
 }
 
-/// Why a reload did not produce a config.
+/// Why a reload did not produce a config. Kept here under a distinct
+/// name because `crate::config::ConfigLoad` in each miner is the same
+/// tri-state (see [`crate::config_util::ConfigLoad`]); the miners' own
+/// `Config::load` implementations map onto it.
 #[derive(Debug, Clone)]
 pub enum LoadError {
     /// The config file does not exist.

@@ -147,8 +147,9 @@ impl Report {
     }
 }
 
-/// Parse "host[:port]" (no scheme) into (host, port), defaulting to the given
-/// port when absent. Accepts `host`, `host:port`, `[v6]:port`; scheme
+/// Parse `host[:port]` (no scheme) into (host, port), defaulting to the given
+/// port when absent. Accepts `host`, `host:port`, `[v6]:port` (bracketed
+/// IPv6); scheme
 /// prefixes (stratum+tcp://, http://) are stripped so users can paste pool
 /// URLs straight from a pool's website.
 pub fn endpoint_host_port(endpoint: &str, default_port: u16) -> Option<(String, u16)> {

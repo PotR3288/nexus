@@ -29,7 +29,10 @@
 pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Pause before reconnecting after a dropped connection or login failure.
 pub const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-/// Login response deadline.
+/// Login response deadline — upper bound across SUCCESSFUL reads. A silent
+/// pool fails earlier: any read error (including READ_TIMEOUT) is fatal
+/// during login, so the 30 s bound applies only while interim lines keep
+/// arriving without a matching reply.
 pub const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// JSON-RPC id of the login request (pools echo it in the reply; the reader
@@ -84,6 +87,9 @@ pub fn target_to_difficulty(target_hex: &str) -> Result<u64, String> {
         return Err("target is zero".to_string());
     }
     let difficulty = u32::MAX as u64 / target_u32 as u64;
+    // Unreachable: target_u32 is a nonzero u32, so u32::MAX/target_u32 >= 1
+    // always — the zero case is handled by the target_u32 == 0 check above.
+    // Kept as a defensive guard against future refactors of that check.
     if difficulty == 0 {
         return Err("target above u32::MAX — zero difficulty".to_string());
     }

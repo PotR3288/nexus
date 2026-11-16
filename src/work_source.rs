@@ -113,7 +113,7 @@ pub trait WorkSourceEntry: Clone + Send + Sync + 'static {
     /// selection-watching purposes. Contract: the URL comes FIRST,
     /// terminated by a NUL (`"{url}\u{0}..."`) — the selection watcher
     /// distinguishes a source switch from a login-key edit by extracting
-    /// that URL prefix (see [`identity_url`]).
+    /// that URL prefix (see `identity_url`).
     fn identity(&self) -> String;
     /// Full fingerprint modulo `enabled` — the hot-reload carryover key.
     /// Excludes `enabled` (standby surgery is not a credential change) and
@@ -148,7 +148,7 @@ pub const REVERT_COOLDOWN: Duration = Duration::from_secs(300);
 /// after a reorg) are normal; only a sustained streak means the source cannot
 /// validate anything right now.
 pub const REJECT_THRESHOLD: u32 = 5;
-/// Poll interval of the selection watcher ([`spawn_selection_watcher`]):
+/// Poll interval of the selection watcher (`spawn_selection_watcher`):
 /// how often job-entry identity is compared against the current selection.
 pub const SELECTION_WATCH_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -165,9 +165,11 @@ fn identity_url(identity: &str) -> &str {
 /// when this cooldown expires and selection probes the entry again, ONE
 /// rejected submission re-bans it at once. A short RETRY_AFTER would
 /// ping-pong dead→failover→dead every minute, each cycle burning a lost
-/// share; 300 s keeps probe cost to one rejected share per five minutes while
-/// still letting a recovered validator be picked up (an accepted share clears
-/// the ban immediately).
+/// share; 300 s keeps probe cost to one rejected share per five minutes.
+/// An accepted share clears the rejection STREAK so the entry is not
+/// re-banned on one rejection after cooldown expiry — the cooldown itself
+/// still runs its full course before the entry is probed (see
+/// `Candidate::consecutive_rejects`).
 pub const REJECT_COOLDOWN: Duration = Duration::from_secs(300);
 
 /// One candidate entry and its runtime state (indexed by config order).
@@ -182,9 +184,11 @@ struct Candidate {
     /// working one immediately instead of burning three strikes.
     was_verified: bool,
     /// This entry was REVERTED from — it never worked while a verified entry
-    /// did, so selection must not hand it back even after its cooldown
-    /// expires (that would ping-pong dead→revert→dead every cooldown).
-    /// Cleared by the first success on this entry and by
+    /// did, so selection skips it (even when its cooldown has expired) until
+    /// its REVERT_COOLDOWN expires and `select()` re-qualifies it for ONE
+    /// probing opportunity per cooldown cycle (the failback path; without
+    /// this the entry would be locked out forever). Cleared permanently by
+    /// the first success on this entry and by
     /// [`PoolManager::replace`] (a fresh config gives a new primary its first
     /// chance again).
     reverted: bool,
@@ -196,8 +200,9 @@ struct Candidate {
     /// streak PERSISTS across bans (rotate does not reset it): when a banned
     /// entry's cooldown expires and selection probes it again, ONE more
     /// rejection re-bans it immediately instead of burning another full
-    /// threshold. An accepted share resets everything — that is the failback
-    /// signal (the source's validator demonstrably works again).
+    /// threshold. An accepted share resets the streak — the failback signal
+    /// (the source's validator demonstrably works again) — though the cooldown
+    /// on a banned entry still runs its full course before it is probed.
     consecutive_rejects: u32,
 }
 
@@ -412,7 +417,9 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             // entry select() would return right now (covers the one-cycle lag
             // where an in-flight window still mines the previous entry). Lock
             // order pools→candidates is preserved; connected_urls is taken
-            // after both are released.
+            // while `pools` is still held (consistent with rotate(), which
+            // also nests connected_urls under pools); the candidates guard
+            // above is dropped before candidates is re-locked below.
             let active_idx = self.active.load(Ordering::Relaxed);
             let selected_idx = {
                 let candidates = self.candidates.lock().unwrap();
@@ -435,6 +442,11 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             c.was_verified = true;
             c.reverted = false;
         }
+        // The active pointer follows the entry a success was just proven on
+        // (unconditional — any connected entry may become the next source).
+        // Display stays truthful because active_pool() additionally requires
+        // the entry's URL to be in connected_urls, which is only inserted for
+        // the active/selected entry.
         self.active.store(index, Ordering::Relaxed);
     }
 
@@ -681,10 +693,13 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     }
 
     /// Select the entry for the next work fetch. Prefers the highest-priority
-    /// (lowest-index) ENABLED candidate that isn't on cooldown; falls back to
-    /// the current active, then the first enabled entry, when all are cooling
-    /// down (the probe attempt itself is the retry). `None` when no entry is
-    /// enabled at all.
+    /// (lowest-index) ENABLED candidate that isn't on cooldown and wasn't
+    /// reverted-from; reverted entries whose cooldown has expired are
+    /// re-qualified first (one probing opportunity per cooldown cycle — see
+    /// `Candidate::reverted`). Falls back to the current active, then the
+    /// first enabled entry, when no eligible candidate remains (all on
+    /// cooldown or reverted-from — the probe attempt itself is the retry).
+    /// `None` when no entry is enabled at all.
     pub fn select(&self) -> Option<Selection<E>> {
         // Re-qualify reverted entries whose cooldown has expired: the
         // preferred (highest-priority) entry gets ONE probing opportunity per
@@ -757,8 +772,9 @@ impl<E: WorkSourceEntry> PoolManager<E> {
             chosen = Some(i);
             break;
         }
-        // All enabled candidates on cooldown — use the current active if it is
-        // still an enabled entry, else the first enabled one anyway.
+        // No eligible enabled candidate — on cooldown OR reverted-from.
+        // Use the current active if it is still an enabled entry, else the
+        // first enabled one anyway.
         let index = match chosen {
             Some(i) => i,
             None => {
@@ -798,8 +814,10 @@ impl<E: WorkSourceEntry> PoolManager<E> {
     /// the connection would keep mining under the credentials captured at
     /// connect time. Same URL + changed identity means "re-login with the new
     /// credentials"; different URL means "connect to the new selection". The
-    /// watcher shares the SAME manager instance (Arc) so hot-reload replaces
-    /// are visible to it.
+    /// flag ALSO fires when select() returns None (no enabled entry at all —
+    /// chain emptied/disabled): the in-flight job's source is gone, so the
+    /// loop must still be interrupted. The watcher shares the SAME manager
+    /// instance (Arc) so hot-reload replaces are visible to it.
     pub fn spawn_selection_watcher(
         pools: Arc<Self>,
         job_entry_identity: Arc<Mutex<Option<String>>>,
