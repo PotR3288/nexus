@@ -485,7 +485,7 @@ pub fn events_limit(query: &str) -> usize {
 /// Tail of a log file for the GUI log pane (xtminer's /log semantics):
 /// `{"path": …, "lines": […]}`, last N lines in chronological order, N
 /// clamped to [50, 2000] with default 500. Only the tail is read — an
-/// unbounded log must not be loaded whole on every poll (see [`tail_lines`]).
+/// unbounded log must not be loaded whole on every poll (via `tail_lines`).
 pub fn log_tail_of_file(query: &str, path: &std::path::Path) -> (u16, Value) {
     let lines = query
         .split('&')

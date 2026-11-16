@@ -16,7 +16,7 @@
 //! exactly like `logging::stderr_colored`'s styling gate.
 //!
 //! Interleaving safety: every curated console write in this crate goes
-//! through [`with_console`] + [`clear_current_row`], so each line ALWAYS
+//! through `with_console` + `clear_current_row`, so each line ALWAYS
 //! starts by clearing whatever is on its row — an event line that lands
 //! mid-animation clears the spinner frame and prints on its own row, and a
 //! line racing `stop` (flag already cleared, final frame not yet erased)

@@ -6,7 +6,7 @@
 //! Both miners speak the Monero pool protocol (the dialect unmodified xmrig
 //! speaks — pools like Kryptex's `xtm-rx-*` / C29 `xtm-*` servers). The
 //! session machinery itself (transport, reader loop, keepalives, submit
-//! correlation) now lives in the async core [`crate::stratum_async`]; what
+//! correlation) now lives in the async core `crate::stratum_async`; what
 //! remains here is the protocol vocabulary shared by every consumer: the
 //! framing constants, the login-string rule, and xmrig's `target`→
 //! difficulty mapping.

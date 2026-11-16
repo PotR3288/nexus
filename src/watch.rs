@@ -79,9 +79,8 @@ struct Watcher<C> {
 }
 
 /// Why a reload did not produce a config. Kept here under a distinct
-/// name because `crate::config::ConfigLoad` in each miner is the same
-/// tri-state (see [`crate::config_util::ConfigLoad`]); the miners' own
-/// `Config::load` implementations map onto it.
+/// name because the miners' own `Config::load` tri-state maps onto it
+/// (see `config_util::LoadResult`).
 #[derive(Debug, Clone)]
 pub enum LoadError {
     /// The config file does not exist.
