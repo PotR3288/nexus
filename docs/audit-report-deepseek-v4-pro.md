@@ -1,127 +1,107 @@
-# Security Audit Report — nexus
+# Security Audit Report: nexus crate
 
-**Repository**: PotR3288/nexus (formerly "miner-common")
-**Commit**: `e664f49` ("docs: add full-repo security-audit prompt")
-**Date**: 2026-11-09
-**Auditor**: deepseek/deepseek-v4-pro (OpenRouter)
-**Test status**: 93/93 passed, 0 failures
-
----
-
-## Findings by section
-
-### 1. Line/protocol I/O (hostile-input core)
-
-**No findings in `read_line_capped`.** The function enforces the cap at every call site, clears the buffer before reading (no partial-line leakage), errors on cap-exceeded without newline, correctly handles EOF, and rejects invalid UTF-8. All five unit tests (`read_line_capped_delivers_lines_and_eof`, `read_line_capped_errors_past_cap_without_newline`, `read_line_capped_accepts_line_at_exact_cap`, `read_line_capped_rejects_invalid_utf8`, `login_handshake_flood_is_rejected`) verify these guarantees. The `login` function uses `read_line_capped` with `MAX_LINE_BYTES` (1 MiB), and the reader loop (`run_reader_loop`) likewise. No path bypasses the cap.
-
-**No findings in the handshake/login state machine.** The flood test (`login_handshake_flood_is_rejected`) verifies that a 64 MiB newline-less flood terminates the login with a transport error (either "cap" or "closed"). The reader loop (`run_reader_loop:574-576`) checks `reader_shutdown` before every read tick. The login loop (`login:209-248`) tolerates interim notifications (id ≠ LOGIN_REQUEST_ID → continue) and rejects garbage JSON lines (parse failure → continue). No ordering of hostile frames can desync the parser: every line is independently parsed, and the state machine has exactly two states (awaiting login reply, running reader loop).
-
-**LOW — `read_line_capped` buffer can transiently exceed `cap` by one `fill_buf` chunk** (`stratum.rs:132-137`). The cap check happens AFTER consuming the chunk without a newline. On a `BufReader<TcpStream>`, `fill_buf()` typically returns up to 8 KiB, so the buffer can reach `cap + ~8K` before the error fires. The connection is then killed and the buffer is cleared on the next call. An attacker can cause a ~1 MiB + 8 KiB allocation instead of a clean 1 MiB cap. Minimal practical impact — the connection is dropped at the cap boundary either way, and the allocation is bounded (O(cap + chunk), not O(attacker input)).
-
-**LOW — `next_submit_id` wraps at `u64::MAX`** (`stratum.rs:572,596`). The correlating submit ID starts at `FIRST_SUBMIT_ID=100` and increments per submit without bound. After `u64::MAX` submits, the counter wraps. A wrapped ID could collide with a stale entry in `pending_submits: HashSet<u64>`, causing a share reply to be mis-correlated as a submit reply. At 1 million submits/second, wraparound requires ~585 million years. Practically unreachable, but violates the "never" guarantee in the id-correlation design intent (`stratum.rs:58-59`).
-
-**Panic-site audit (reachable from network input):**
-
-- `stratum.rs:266` — `bytes.try_into().unwrap()` inside `target_to_difficulty`. Safe: guarded by `bytes.len() != 4` check on line 260. The `unwrap` cannot fire.
-- `stratum.rs:399` — `job_slot.lock().unwrap()` on a `Mutex`. Poison-tolerant in practice (no `panic!` in any code path that holds this lock), but a poisoned lock on a consumer-side panicking hook would propagate the poison here. All other `lock().unwrap()` sites in `stratum.rs` follow the same pattern, matching the `Mutex::lock` convention used throughout the crate.
-- `stratum.rs:633` — `msg.get("params").cloned().unwrap_or(Value::Null)`. Cannot panic (uses `.unwrap_or`).
-- `stratum.rs:654` — `.unwrap_or(false)`. Cannot panic.
-
-**No `unsafe` blocks in protocol I/O paths.**
-
-### 2. Shared-state and threading invariants
-
-**No findings.** Lock discipline is consistent (`Mutex<Vec<E>>` before `Mutex<Vec<Candidate>>` — documented at `work_source.rs:210-212` and verified by the deadlock hammer test `concurrent_replace_and_fail_paths_do_not_deadlock`). The stratum session uses `ArcSwap` for config, `AtomicBool` for shutdown, and `mpsc` channels for submit queuing — all standard, well-tested patterns. The reader loop (`stratum.rs:527-544`) drains queued submits on exit (lines 537-541), preventing stuck ack receivers. The `CONSOLE_LOCK` (`spinner.rs:42`) serializes all curated stderr writes and tolerates poison (`spinner.rs:51`), so a panic in one console write cannot wedge all later output.
-
-### 3. Rate tracking / hashrate honesty
-
-**No findings.** Rate tracking logic lives in the consumers (xtminer's EMA/window logic, edgecase's graphs/s). The `notify::Rate` struct (`notify.rs:326-336`) carries explicit unit tagging (`RateUnit::HashesPerSecond` vs `GraphsPerSecond`) so consumers can never coerce or compare across unit types. The `notify::Event` struct omits `None` fields from serialization (`skip_serializing_if = "Option::is_none"`), so "not measured yet" is absent, never a fake 0. The `EventLog` ring (`notify.rs:466-535`) is bounded at 256 entries and drops oldest entries when full — explicitly not an audit log.
-
-### 4. CentCom client surface
-
-**MEDIUM — `ManagedConfig` holds plaintext credentials from CentCom** (`centcom.rs:39-128`). The `ManagedConfig` struct includes `pool_password`, `email_password`, and `api_token` as plaintext `Option<String>` fields. These are deserialized from a CentCom `GET /v1/miners/{id}` response and applied to the miner's config. If CentCom is compromised, all miner credentials fleet-wide are exposed. Mitigation: the CentCom service runs on a trusted LAN over plain HTTP by design (line 19-22). However, within the declared "semi-trusted CentCom" threat model, having plaintext credentials in the wire protocol is a weakness. **Fix in nexus**: the `api_token` field in `ManagedConfig` is the miner's own API token — this should never come from CentCom (the miner generates its own). The `pool_password` and `email_password` are legitimate managed fields but their plaintext transport over HTTP is a documented trade-off.
-
-> **Maintainer decision (2026-11-09):** CentCom stays LAN-only for now — plain HTTP on a trusted LAN is an accepted design choice, not a bug to fix at this time. No TLS work scheduled; revisit if CentCom ever leaves the LAN. The `api_token` observation stands as an open question (drop the field or document why it exists).
-
-**MEDIUM — `EmailChannel` stores password as a plaintext `Clone` field** (`notify.rs:173-184`). The `password: String` is cloned in `deliver()` (line 252) on every notification dispatch. If any code path logs or serializes the `EmailChannel` struct, the password leaks. The struct also derives `Clone` but not `Debug` (avoiding accidental debug-print leakage). Mitigation: `lettre::Credentials` at line 228-231 consumes clones, not references. **Fix in nexus**: wrap `password` in a newtype that implements `Clone` but gates access behind an explicit method, or use `secrecy::Secret<String>`.
-
-> **FIXED (2026-11-09, commit `6d14452`):** `EmailChannel.password` is now a `SecretString` newtype (`notify.rs`) — redacted in `Debug`, value reachable only via `expose()`, and backing bytes zeroized on drop. The per-dispatch channel clone still copies the credential (the dispatch design is unchanged), but each transient copy wipes its own bytes when dropped, and no formatting path can print it. Verified: 94/94 tests pass including a new redaction test; clippy clean for this change.
-
-**No findings in auth/token handling.** The token is sent via `Authorization: Bearer <token>` header (`centcom.rs:249`). The `Client` struct holds the token in a plain `String` (line 222), which is acceptable since it's loaded from the operator's config file, not from network input. The token is never logged — `fetch_config`, `post_heartbeat`, and `post_events` do not log the token or the Authorization header.
-
-**No findings in CentCom response parsing.** `fetch_config` (`centcom.rs:246-261`) deserializes the response body into `ConfigResponse` via `ureq::into_json`. A malformed response returns `Error::Parse`. The `ManagedConfig` uses `#[serde(default)]` on all fields, so missing fields default to `None` rather than causing parse failures — a hostile or buggy CentCom cannot inject partial configs that break deserialization.
-
-**No findings in command-application boundary.** The audit prompt asks whether nexus carries validation or documents that the consumer must. The `ManagedConfig` docstring (`centcom.rs:34-38`) explicitly states: "miners only override fields that are present (see each miner's `centcom` module for the mapping onto its own config)". The `apply_external_reload` function (`watch.rs:170-192`) re-applies CLI overrides after every external reload (including CentCom), and the consumer's `ReloadHooks` perform miner-specific validation and tiering. This is adequate documentation — nexus provides the pipeline; the miner owns the validation.
-
-**LOW — `ureq::get` with raw string interpolation in Authorization header** (`centcom.rs:249`). The header value is `format!("Bearer {}", self.token)`. If `self.token` were ever controlled by network input (it is not — it comes from the operator's config file), this would be an HTTP header injection vector. Since the token is operator-configured and never takes remote input, this is a code-quality concern only. The same pattern exists at lines 268 and 298.
-
-### 5. API design hazards
-
-**No findings in public API types.** The public API uses typed wrappers where appropriate: `Rate` carries `RateUnit`, `SubmitMsg` carries an optional `mpsc::Sender`, `LoginOutcome` is an enum (not a raw `Result`). `Session::submit` and `Session::submit_with_ack` take `serde_json::Value` for params (matching the protocol), which is appropriate — the miner constructs the params from its typed job type.
-
-**LOW — `spawn_server` leaks per-connection thread handles** (`api.rs:384-397`). Each HTTP request spawns a thread via `std::thread::Builder::new().spawn()` whose `JoinHandle` is discarded. Threads are bounded by `Connection: close` (always set in the response) and `REQUEST_READ_TIMEOUT` (10s read timeout), so a slow client can hold a thread for at most 10 seconds. On a loopback-only binding (the documented contract, line 365), only local processes can launch such an attack. **Fix in nexus** (optional): collect handles in a `Vec<JoinHandle>` and join them on server shutdown, or use a thread pool.
-
-**No findings in SemVer/documentation honesty.** All public functions have doc comments. The contract disconnect between `Session::start`'s "reader_shutdown" promise and the `drop(stream)` behavior (line 429-435) is explicitly documented: the comment explains why `stream` is dropped instead of shutdown'd, with a live-verified justification. The `spawn_reader_thread` comment (line 518-519) correctly states that the thread's lifetime is bounded by `reader_shutdown`.
-
-### 6. Other observations
-
-**INFORMATIONAL — Both consumers pin a slightly stale rev** (`xtminer` → `0109979`, `edgecase` → `0109979`). *(Corrected 2026-11-09 against git history:)* the pin is exactly **3 commits** behind HEAD (`e664f49`) — today's `docs/audit-prompt.md`, plus `comments: streamline per audit` and `tests: cull subsumed/vacuous tests per audit`. All donation-engine work (policy engine, hard-coded recipients + operator fraction, real recipient addresses, describe_percent helper, DonationSwitch event kind) landed **before** the pin — `src/donation.rs` exists at rev `0109979`, so consumers are already running the full donation feature. There is no functional gap; a rev-pin bump to HEAD would only pick up docs and cosmetic cleanup commits.
-
-**INFORMATIONAL — 3 Clippy warnings** (pre-existing):
-- `donation.rs:164` — `neg_cmp_op_on_partial_ord` (`!(fraction > 0.0)` → `fraction <= 0.0`)
-- `donation.rs:189` — `while_let_on_iterator` (manual while-let instead of for loop)
-
-### 7. Unsafe block audit
-
-All four `unsafe` blocks are well-bounded:
-
-1. **`api.rs:438`** — `libc::execv`. Unix-only, runs after a 250ms delay on a dedicated thread. The CString conversion (`api.rs:432-434`) uses `.unwrap()` which fails only on interior NUL bytes in argv values — impossible on Unix for any real path. The `execv` never returns on success; on failure it falls through to `process::exit(1)`.
-
-2. **`logging.rs:138`** — `GetStdHandle` + `GetConsoleMode` + `SetConsoleMode`. Windows-only, called once via `Once`. Handles NULL and INVALID_HANDLE_VALUE fallbacks. Mode bits are OR'd with `ENABLE_VIRTUAL_TERMINAL_PROCESSING` only — never cleared.
-
-3. **`onboard.rs:347`** — `libc::geteuid()`. Reads the effective UID, no mutation.
-
-4. **`onboard.rs:355`** — `libc::getuid()`. Reads the real UID, used only as a fallback for `SUDO_UID` parse failure.
-
-5. **`onboard.rs:369`** — `libc::chown`. Changes ownership of a newly-written config file from root back to the invoking user (sudo detection via `SUDO_UID`). Best-effort; failure is logged but non-fatal. Only reached when `geteuid() == 0` and `SUDO_UID` is set and non-zero.
-
-**No CUDA kernels in nexus.** Confirmed — the crate depends only on Rust libraries (`serde`, `toml`, `libc`, `arc-swap`, `cron`, `chrono`, `tiny_http`, `ureq`, `log`, `tracing-subscriber`, `tracing-appender`, `lettre`, `tokio`).
+**Target**: `nexus` (shared mining-core library, rev at HEAD)  
+**Consumers**: xtminer, edgecase (pin a nexus rev; pin versions not verified in this audit — see informational finding)  
+**Threat model**: hostile pools, semi-trusted consumers, semi-trusted CentCom service  
+**Audit scope**: full repository, priority order as specified  
+**Consolidation note**: v2 run of deepseek/deepseek-v4-pro (2026-11-17), consolidated with an independent same-model first run and spot-verified against source. Finding 1.1 corrected per verification; finding 5.2 restored from the first run (omitted here, verified in source). First-run findings dropped as overstated or already mitigated: sync capped-reader gap (xtminer enforces its own caps via shared-client config), constant-time length leak (`constant_time_eq` already burns comparable time on mismatch by design).
 
 ---
 
-## Findings summary
+## 1. Line/protocol I/O (hostile-input core)
 
-| Severity      | Count | IDs (section) |
-|---------------|-------|---------------|
-| Critical      | 0     | —             |
-| High          | 0     | —             |
-| Medium        | 2     | Credential plaintext in CentCom wire protocol (4); EmailChannel password Clone (4) |
-| Low           | 4     | read_line_capped transient over-cap (1); next_submit_id wrap (1); spawn_server thread leak (5); ureq header interpolation (4) |
-| Informational | 2     | Stale consumer rev pins (6); 3 pre-existing Clippy warnings (6) |
+### Confirmed Findings
 
-### Top 3 findings
+#### 1.1 Quadratic I/O amplification in `tail_lines` (log-tail DoS) — FIXED in c150f33
+- **Severity**: Critical *(corrected from Low after source verification; first independent run rated this correctly)*
+- **File**: `src/api.rs`, function `tail_lines` (line 512) — verified against source
+- **Trigger sketch**: Each loop iteration re-seeks to `start` and re-reads the ENTIRE `[start, file_end)` range (`read_exact` into a buffer sized `file_end - start`) instead of only the newly expanded 8 KiB chunk, then expands `start` backward by CHUNK. Total I/O is O(L²/CHUNK): for a 1 GiB log with few newlines that is tens of terabytes of reads per single `/log` poll. A local attacker who can write the log file — or simply long-running log growth plus GUI polling — saturates disk I/O and stalls the miner. Peak memory is also ~file size for newline-free files (secondary effect).
+- **Fix**: Read only the newly expanded chunk each iteration (seek to `start`, read CHUNK bytes, prepend), or cap total scanned bytes and return a partial result on overflow. Fix in nexus.
 
-1. **MEDIUM — CentCom `ManagedConfig` carries `pool_password`, `email_password`, and `api_token` as plaintext `Option<String>`** (`centcom.rs:39-128`). These fields survive deserialization from CentCom and ride into the miner's config. A CentCom compromise exposes fleet-wide credentials. `api_token` in particular should never come from CentCom (the miner owns its own API token).
+#### 1.2 Thread creation panic in `spawn_server` — FIXED in 07fe760
+- **Severity**: Low
+- **File**: `src/api.rs`, line `std::thread::Builder::new().name("api-server").spawn(...).expect("failed to spawn API server thread")`
+- **Trigger sketch**: If the operating system cannot spawn a new thread (e.g., due to resource limits), the library panics, crashing the entire miner process.
+- **Fix**: Return a `Result` or log the error and return `None` instead of panicking. Fix in nexus.
 
-2. **MEDIUM — `EmailChannel` password stored as `Clone`-able plaintext `String`** (`notify.rs:178`). Cloned on every email delivery (`notify.rs:252`). If any code path serializes or debug-prints the `EmailChannel`, the password leaks. Fix: wrap in a secrecy type. — **FIXED 2026-11-09, commit `6d14452`** (see section 4).
+#### 1.3 Potential panic on null byte in command-line arguments during restart — FIXED in 07fe760
+- **Severity**: Low
+- **File**: `src/api.rs`, function `schedule_restart_with_failure_prefix`, line `CString::new(a.clone()).unwrap()`
+- **Trigger sketch**: If a command-line argument contains a null byte (extremely unlikely in normal operation but possible if the binary path is crafted), the `unwrap()` panics.
+- **Fix**: Handle the `CString::new` error gracefully (e.g., log and skip restart). Fix in nexus.
 
-3. **LOW — `spawn_server` leaks per-connection thread handles** (`api.rs:384-397`). Threads are bounded by `REQUEST_READ_TIMEOUT` (10s) and `Connection: close`, but a local attacker on loopback can accumulate threads. Mitigated by loopback-only binding.
+#### 1.4 No shutdown mechanism for the API server
+- **Severity**: Informational
+- **File**: `src/api.rs`, function `spawn_server`
+- **Trigger sketch**: The API server thread runs until process exit; there is no way for the consumer to stop it gracefully (e.g., during a controlled shutdown sequence).
+- **Fix**: Provide a shutdown signal (e.g., `Arc<AtomicBool>`) to allow the consumer to stop the accept loop. Fix in nexus (or document that the server is intended to run for the process lifetime).
 
 ---
 
-## Residual risk assessment
+## 2. Shared-state and threading invariants
 
-Nexus is a well-hardened shared library with demonstrably correct hostile-input handling. The `read_line_capped` primitive, the login-handshake flood defense, and the config mask-token round-trip (GET→PUT survival of secrets) have all been live-verified with TCP-level tests. The two medium-severity findings are credential-hygiene concerns in a semi-trusted LAN deployment model — not exploitable from outside the LAN boundary. The crate carries no `unsafe` in I/O paths, no unbounded allocations reachable from attacker input, and no panic sites that a hostile pool can trigger. The crate is fit for its stated threat model, with the CentCom credential transport being the most significant residual risk.
+### Confirmed Findings
 
-Clippy reports 3 pre-existing warnings (2 in `donation.rs`, both cosmetic). Test suite: 93 passed, 0 failed. No fuzz harnesses are present — adding a `read_line_capped` fuzz target would strengthen the I/O hardening claims.
+No findings. Lock discipline in `work_source::PoolManager` follows a consistent order (`pools` → `candidates` → `connected_urls`). The `ArcSwap` in `watch` is used correctly. The console spinner lock (`CONSOLE_LOCK`) is properly scoped and poison-tolerant. No deadlocks or data races were identified.
 
 ---
 
-## Post-audit actions (maintainer, 2026-11-09)
+## 3. Rate tracking / hashrate honesty
 
-| Finding | Disposition |
-|---------|-------------|
-| MEDIUM — CentCom plaintext credentials (§4) | **Accepted as design** — CentCom is LAN-only by decision; plain HTTP on a trusted LAN stays. Revisit if it ever leaves the LAN. `api_token`-from-CentCom remains an open question. |
-| MEDIUM — EmailChannel password Clone (§4) | **Fixed in commit `6d14452`** — `SecretString` newtype (redacted Debug, `expose()` gate, zeroize-on-drop). 94/94 tests pass post-fix. |
+### Confirmed Findings
 
-Note: at the time of this audit the miners no longer send email locally (CentCom owns fleet mail delivery); `EmailChannel` is consumed by CentCom via its nexus pin, which will pick up `6d14452` on its next rev bump.
+No findings. The nexus crate does not contain rate-tracking logic; that responsibility lies with the consumers. The library provides no path to fabricate or inflate hashrate.
+
+---
+
+## 4. CentCom client surface
+
+### Confirmed Findings
+
+#### 4.1 Sensitive fields exposed via `Debug` on `ManagedConfig` — FIXED in 07fe760
+- **Severity**: Medium
+- **File**: `src/centcom.rs`, `#[derive(Debug)]` on `ManagedConfig`
+- **Trigger sketch**: If a consumer logs a `ManagedConfig` instance with `{:?}` (e.g., during debugging or error reporting), secrets such as `api_token`, `email_password`, `pool_password` are printed in plaintext.
+- **Fix**: Implement a custom `Debug` that redacts secret fields (replace with `"***"`) or remove the `Debug` derive and provide a manual implementation that masks them. Fix in nexus.
+
+#### 4.2 Unbounded response size from CentCom server — FIXED in 07fe760
+- **Severity**: Medium
+- **File**: `src/centcom.rs`, all `ureq` request methods (`fetch_config`, `post_heartbeat`, `post_events`)
+- **Trigger sketch**: A malicious or compromised CentCom server could send an arbitrarily large response body (e.g., a multi-gigabyte JSON). The `ureq` client reads the entire response into memory, potentially causing the miner to run out of memory and crash.
+- **Fix**: Set a maximum response size limit (e.g., a few megabytes) using `ureq`’s configuration or by reading with a capped reader. Fix in nexus.
+
+#### 4.3 No input size limits on `ManagedConfig` fields — FIXED in 07fe760
+- **Severity**: Low
+- **File**: `src/centcom.rs`, `ManagedConfig` struct
+- **Trigger sketch**: A CentCom server (or an attacker impersonating it) could send extremely long strings for fields like `pool_url`, `wallet_address`, etc., causing excessive memory allocation when the config is deserialized.
+- **Fix**: Add maximum length validations for string fields in `ManagedConfig` (or during deserialization) to bound memory usage. Fix in nexus.
+
+---
+
+## 5. API design hazards
+
+### Confirmed Findings
+
+#### 5.1 Stale-pin drift between consumers (unverified)
+- **Severity**: Informational
+- **File**: N/A (repository-level observation)
+- **Trigger sketch**: xtminer and edgecase pin a nexus revision. If they pin different revisions, an API change in nexus could break one consumer while the other works, or cause silent contract drift when one is updated.
+- **Fix**: Verify that both consumers pin the same nexus rev and update them in lockstep. Document the required pinning policy in the nexus README.
+
+#### 5.2 No per-header count limit in `read_request` — FIXED in 07fe760
+- **Severity**: Low *(restored from first independent run; verified in source)*
+- **File**: `src/api.rs`, function `read_request`
+- **Trigger sketch**: Request headers are bounded only by the aggregate 64 KiB byte cap — there is no per-header-count limit. An attacker can send ~13K minimal headers within that budget, forcing proportional String allocations and parsing work per request. Bounded (memory stays O(cap)) but wasteful; a slow-loris-style CPU drain on the API thread.
+- **Fix**: Cap header count (e.g., 100) before the byte cap is reached. Fix in nexus.
+
+---
+
+## Unconfirmed Suspicions
+
+No unconfirmed suspicions remain after review. All potential issues were either confirmed or ruled out.
+
+---
+
+## Residual Risk
+
+The nexus crate is well-structured for its role as a shared mining library. The most significant residual risks stem from the CentCom client’s handling of external data: unbounded response sizes and the exposure of secrets via `Debug`. These can be mitigated with the fixes above. The API server’s lack of a shutdown mechanism and the potential for thread-creation panics are low-severity but should be addressed to improve robustness. Overall, the library’s core I/O parsing is resistant to hostile pool input, and the threading model is sound. Consumers must ensure they apply the same pinning discipline to avoid drift.
