@@ -36,7 +36,11 @@ use std::time::Duration;
 /// optional: a profile may manage any subset, and miners only override
 /// fields that are present (see each miner's `centcom` module for the
 /// mapping onto its own config).
-#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+///
+/// `Debug` is implemented manually: credential fields (`pool_password`,
+/// `api_token`, `email_password`) print as `Some("***")` so a `{:?}` log
+/// line can never leak them (audit finding 4.1).
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct ManagedConfig {
     // ── Pool / work source ────────────────────────────────────────────────
     /// Primary stratum/proxy endpoint (e.g. "stratum+tcp://host:port").
@@ -127,6 +131,116 @@ pub struct ManagedConfig {
     pub email_report_interval_secs: Option<u64>,
 }
 
+/// Debug view of a credential field in [`ManagedConfig`]: preserves presence
+/// (`Some`) without the value (audit finding 4.1).
+struct Redacted<'a>(&'a Option<String>);
+
+impl fmt::Debug for Redacted<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(_) => write!(f, "Some(\"***\")"),
+            None => write!(f, "None"),
+        }
+    }
+}
+
+impl fmt::Debug for ManagedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Mirrors the derived Debug except credential fields are redacted —
+        // a `{:?}` log line must never print them (audit finding 4.1).
+        f.debug_struct("ManagedConfig")
+            .field("pool_url", &self.pool_url)
+            .field("work_source", &self.work_source)
+            .field("worker_id", &self.worker_id)
+            .field("pool_password", &Redacted(&self.pool_password))
+            .field("failover_urls", &self.failover_urls)
+            .field("wallet_address", &self.wallet_address)
+            .field("coinbase_extra", &self.coinbase_extra)
+            .field("mining_miner_id", &self.mining_miner_id)
+            .field("ntrims", &self.ntrims)
+            .field("hashrate_report_secs", &self.hashrate_report_secs)
+            .field("hashrate_windows", &self.hashrate_windows)
+            .field("log_level", &self.log_level)
+            .field("hashrate_only", &self.hashrate_only)
+            .field("api_enabled", &self.api_enabled)
+            .field("api_port", &self.api_port)
+            .field("api_token", &Redacted(&self.api_token))
+            .field("node_url", &self.node_url)
+            .field("node_network", &self.node_network)
+            .field("email_enabled", &self.email_enabled)
+            .field("email_host", &self.email_host)
+            .field("email_port", &self.email_port)
+            .field("email_from", &self.email_from)
+            .field("email_to", &self.email_to)
+            .field("email_username", &self.email_username)
+            .field("email_password", &Redacted(&self.email_password))
+            .field("email_ssl_tls", &self.email_ssl_tls)
+            .field(
+                "email_report_interval_secs",
+                &self.email_report_interval_secs,
+            )
+            .finish()
+    }
+}
+
+/// Hard caps on managed-config field sizes (audit finding 4.3). The response
+/// byte cap bounds the whole document BEFORE deserialization; these bound
+/// what a single field can hold downstream (config structs, log lines) even
+/// within a size-legal document. Generous by design — no legitimate fleet
+/// doc comes close.
+const MAX_FIELD_LEN: usize = 1024;
+/// Max entries in the list fields (`failover_urls`, `email_to`,
+/// `hashrate_windows`).
+const MAX_LIST_ITEMS: usize = 64;
+
+impl ManagedConfig {
+    /// Validate field sizes after deserialization (audit finding 4.3): a
+    /// compromised CentCom must not be able to push megabyte-scale strings
+    /// into the miner's config. Returns the first offending field so callers
+    /// can log which cap was hit; on error the caller should reject the whole
+    /// document and fall back to its local/cached config.
+    pub fn validate_sizes(&self) -> Result<(), String> {
+        let check = |name: &str, v: &Option<String>| match v {
+            Some(s) if s.len() > MAX_FIELD_LEN => {
+                Err(format!("{name} exceeds the {MAX_FIELD_LEN}-byte cap"))
+            }
+            _ => Ok(()),
+        };
+        let list = |name: &str, v: &[String]| {
+            if v.len() > MAX_LIST_ITEMS {
+                return Err(format!("{name} has more than {MAX_LIST_ITEMS} entries"));
+            }
+            for (i, s) in v.iter().enumerate() {
+                if s.len() > MAX_FIELD_LEN {
+                    return Err(format!("{name}[{i}] exceeds the {MAX_FIELD_LEN}-byte cap"));
+                }
+            }
+            Ok(())
+        };
+        check("pool_url", &self.pool_url)?;
+        check("work_source", &self.work_source)?;
+        check("worker_id", &self.worker_id)?;
+        check("pool_password", &self.pool_password)?;
+        list("failover_urls", &self.failover_urls)?;
+        check("wallet_address", &self.wallet_address)?;
+        check("coinbase_extra", &self.coinbase_extra)?;
+        check("mining_miner_id", &self.mining_miner_id)?;
+        check("log_level", &self.log_level)?;
+        check("api_token", &self.api_token)?;
+        check("node_url", &self.node_url)?;
+        check("node_network", &self.node_network)?;
+        check("email_host", &self.email_host)?;
+        check("email_from", &self.email_from)?;
+        list("email_to", &self.email_to)?;
+        check("email_username", &self.email_username)?;
+        check("email_password", &self.email_password)?;
+        if let Some(w) = &self.hashrate_windows {
+            list("hashrate_windows", w)?;
+        }
+        Ok(())
+    }
+}
+
 /// Miner → CentCom status report (POST /v1/miners/{id}/heartbeat).
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Heartbeat {
@@ -212,6 +326,12 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Heartbeat/event-batch timeout: status and event POSTs must never hold up
 /// their thread long — the next tick retries.
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Hard cap on CentCom response bodies (audit finding 4.2): managed config
+/// documents are a few KiB at most, so a multi-gigabyte body from a
+/// compromised service is malformed, not data. The read itself is bounded —
+/// `into_json`/`read_to_end` would otherwise buffer the whole body into
+/// memory before anything could reject it.
+const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Miner-side client for one CentCom profile. Cheap to clone (three
 /// Strings).
@@ -242,7 +362,9 @@ impl Client {
     }
 
     /// Fetch the managed config document. 401/403/404 surface as
-    /// [`Error::Status`] with the service's error message.
+    /// [`Error::Status`] with the service's error message. Response bodies
+    /// are read under a hard byte cap and field sizes validated before the
+    /// document is returned (audit findings 4.2 / 4.3).
     pub fn fetch_config(&self) -> Result<ConfigResponse, Error> {
         let url = format!("{}/v1/miners/{}", self.base_url, self.miner_id);
         let res = ureq::get(&url)
@@ -256,8 +378,11 @@ impl Client {
                 },
                 other => Error::Http(other.to_string()),
             })?;
-        res.into_json::<ConfigResponse>()
-            .map_err(|e| Error::Parse(e.to_string()))
+        let doc = capped_json::<ConfigResponse>(res)?;
+        // Reject documents with absurd field values before any consumer maps
+        // them onto its config (audit finding 4.3).
+        doc.config.validate_sizes().map_err(Error::Parse)?;
+        Ok(doc)
     }
 
     /// Post a status report. Failures are non-fatal by design (the next tick
@@ -275,11 +400,9 @@ impl Client {
                 },
                 other => Error::Http(other.to_string()),
             })?;
-        // 200 with {"ok":true} — drain the (tiny) body and finish.
-        let mut sink = Vec::new();
-        res.into_reader()
-            .read_to_end(&mut sink)
-            .map_err(|e| Error::Http(e.to_string()))?;
+        // 200 with {"ok":true} — drain the (tiny) body under the byte cap
+        // and finish (audit finding 4.2).
+        drain_capped(res)?;
         Ok(())
     }
 
@@ -305,19 +428,56 @@ impl Client {
                 },
                 other => Error::Http(other.to_string()),
             })?;
-        let mut sink = Vec::new();
-        res.into_reader()
-            .read_to_end(&mut sink)
-            .map_err(|e| Error::Http(e.to_string()))?;
+        // 200 with {"ok":true} — drain under the byte cap (audit finding 4.2).
+        drain_capped(res)?;
         Ok(())
     }
 }
 
+/// Read a JSON response body under the hard byte cap, then deserialize
+/// (audit finding 4.2). Bounding the READ is what keeps memory bounded —
+/// `into_json` would buffer an arbitrarily large body before parsing could
+/// reject it. Reading one byte past the cap is enough to detect overflow
+/// without allocating for it.
+fn capped_json<T: serde::de::DeserializeOwned>(res: ureq::Response) -> Result<T, Error> {
+    let mut buf = Vec::new();
+    res.into_reader()
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| Error::Http(e.to_string()))?;
+    if buf.len() > MAX_RESPONSE_BYTES {
+        return Err(Error::Parse(format!(
+            "response body exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+        )));
+    }
+    serde_json::from_slice(&buf).map_err(|e| Error::Parse(e.to_string()))
+}
+
+/// Drain a 2xx response body under the same byte cap as [`capped_json`] —
+/// the POST endpoints' bodies are tiny; we only need to confirm they arrived.
+fn drain_capped(res: ureq::Response) -> Result<(), Error> {
+    let mut sink = Vec::new();
+    res.into_reader()
+        .take(MAX_RESPONSE_BYTES as u64 + 1)
+        .read_to_end(&mut sink)
+        .map_err(|e| Error::Http(e.to_string()))?;
+    if sink.len() > MAX_RESPONSE_BYTES {
+        return Err(Error::Parse(format!(
+            "response body exceeds the {MAX_RESPONSE_BYTES}-byte cap"
+        )));
+    }
+    Ok(())
+}
+
 /// Best-effort extraction of an error response body (ureq keeps the response
-/// attached to Status errors).
+/// attached to Status errors). The read is capped — only 200 chars are kept,
+/// so a hostile service can't make us buffer a huge error body either.
 fn response_body(resp: ureq::Response) -> String {
     let mut buf = Vec::new();
-    resp.into_reader().read_to_end(&mut buf).unwrap_or_default();
+    resp.into_reader()
+        .take(4 * 1024)
+        .read_to_end(&mut buf)
+        .unwrap_or_default();
     // Keep log lines short; the service's error JSON is small anyway.
     String::from_utf8_lossy(&buf).chars().take(200).collect()
 }
@@ -478,5 +638,75 @@ mod tests {
         assert_eq!(cfg.ntrims, Some(60));
         assert!(cfg.pool_url.is_none());
         assert!(cfg.failover_urls.is_empty());
+    }
+
+    #[test]
+    fn debug_redacts_credential_fields() {
+        // A `{:?}` log line must never print credentials (audit finding 4.1):
+        // presence is preserved as Some("***"), values are not.
+        let cfg = ManagedConfig {
+            pool_url: Some("stratum+tcp://p:32765".into()),
+            pool_password: Some("hunter2-secret".into()),
+            api_token: Some("bearer-token-xyz".into()),
+            email_password: Some("email-pass-abc".into()),
+            ..Default::default()
+        };
+        let out = format!("{cfg:?}");
+        assert!(!out.contains("hunter2-secret"));
+        assert!(!out.contains("bearer-token-xyz"));
+        assert!(!out.contains("email-pass-abc"));
+        assert_eq!(out.matches(r#"Some("***")"#).count(), 3);
+        // Non-secret fields still print in full.
+        assert!(out.contains("stratum+tcp://p:32765"));
+    }
+
+    #[test]
+    fn validate_sizes_rejects_oversized_fields() {
+        // A compromised CentCom must not push megabyte-scale strings into the
+        // miner's config (audit finding 4.3).
+        let cfg = ManagedConfig {
+            pool_url: Some("x".repeat(MAX_FIELD_LEN + 1)),
+            ..Default::default()
+        };
+        assert!(cfg.validate_sizes().unwrap_err().contains("pool_url"));
+
+        let cfg = ManagedConfig {
+            failover_urls: vec!["ok".to_string(); MAX_LIST_ITEMS + 1],
+            ..Default::default()
+        };
+        assert!(cfg.validate_sizes().unwrap_err().contains("failover_urls"));
+
+        // A size-legal document passes.
+        let ok: ManagedConfig = serde_json::from_str(
+            r#"{"pool_url":"stratum+tcp://p:32765","email_to":["a@b.c"],"ntrims":48}"#,
+        )
+        .unwrap();
+        assert!(ok.validate_sizes().is_ok());
+    }
+
+    #[test]
+    fn oversized_response_body_is_rejected() {
+        // A hostile service answering with a body past the cap must be
+        // rejected before deserialization allocates for it (audit 4.2).
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf); // consume the request (ignored)
+                let payload = "x".repeat(MAX_RESPONSE_BYTES + 1);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        let c = Client::new(&addr, "rig-a", "tok");
+        match c.fetch_config() {
+            Err(Error::Parse(e)) => assert!(e.contains("cap"), "{e}"),
+            other => panic!("expected capped Parse error, got {other:?}"),
+        }
     }
 }

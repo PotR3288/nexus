@@ -36,6 +36,11 @@ pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Body cap (Content-Length is clamped to this) — json_rpc PUT/POST bodies
 /// are small config documents.
 pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Header-COUNT cap for one request, independent of the byte cap: within the
+/// 64 KiB budget a hostile client could still send ~13K minimal headers and
+/// force proportional String allocations + parsing on the API thread. No real
+/// HTTP client sends anywhere near this many (audit finding 5.2).
+pub const MAX_HEADER_COUNT: usize = 100;
 /// Per-request read timeout: covers a slow dashboard poll; payloads are
 /// small and served from memory.
 pub const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -310,6 +315,11 @@ fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let mut headers: Vec<(String, String)> = Vec::new();
     for line in lines {
         if let Some((k, v)) = line.split_once(':') {
+            // Count cap on top of the byte cap (audit finding 5.2): a header
+            // flood within budget must not force proportional per-header work.
+            if headers.len() >= MAX_HEADER_COUNT {
+                return None;
+            }
             headers.push((k.trim().to_string(), v.trim().to_string()));
         }
     }
@@ -373,37 +383,41 @@ pub fn spawn_server(
     log::info!("API listening on http://{addr} (xmrig-compatible)");
     let token = token.to_string();
 
-    Some(
-        std::thread::Builder::new()
-            .name("api-server".to_string())
-            .spawn(move || loop {
-                match listener.accept() {
-                    Ok((mut stream, _peer)) => {
-                        let hooks = Arc::clone(&hooks);
-                        let token = token.clone();
-                        std::thread::Builder::new()
-                            .name("api-conn".to_string())
-                            .spawn(move || {
-                                if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err() {
-                                    return;
-                                }
-                                let request = match read_request(&mut stream) {
-                                    Some(req) => req,
-                                    None => return, // timeout or malformed — close
-                                };
-                                let (status, payload) = route(hooks.as_ref(), &token, &request);
-                                write_response(&mut stream, status, &payload.to_string());
-                            })
-                            .ok();
-                    }
-                    Err(e) => {
-                        log::warn!("API accept error: {e}");
-                        std::thread::sleep(ACCEPT_ERROR_BACKOFF);
-                    }
+    std::thread::Builder::new()
+        .name("api-server".to_string())
+        .spawn(move || loop {
+            match listener.accept() {
+                Ok((mut stream, _peer)) => {
+                    let hooks = Arc::clone(&hooks);
+                    let token = token.clone();
+                    std::thread::Builder::new()
+                        .name("api-conn".to_string())
+                        .spawn(move || {
+                            if stream.set_read_timeout(Some(REQUEST_READ_TIMEOUT)).is_err() {
+                                return;
+                            }
+                            let request = match read_request(&mut stream) {
+                                Some(req) => req,
+                                None => return, // timeout or malformed — close
+                            };
+                            let (status, payload) = route(hooks.as_ref(), &token, &request);
+                            write_response(&mut stream, status, &payload.to_string());
+                        })
+                        .ok();
                 }
-            })
-            .expect("failed to spawn API server thread"),
-    )
+                Err(e) => {
+                    log::warn!("API accept error: {e}");
+                    std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+                }
+            }
+        })
+        // Thread creation can fail under resource limits (audit finding
+        // 1.2): match the bind-failure path — mining continues without
+        // the API instead of panicking the whole process.
+        .map_err(|e| {
+            log::error!("Failed to spawn API server thread: {e}");
+        })
+        .ok()
 }
 
 /// Re-exec this process with its own argv (same binary, same arguments) so a
@@ -428,10 +442,20 @@ pub fn schedule_restart_with_failure_prefix(failure_prefix: &str) {
             #[cfg(unix)]
             {
                 use std::ffi::CString;
-                let c_args: Vec<CString> = args
+                // An interior NUL in argv means a corrupted environment (audit
+                // finding 1.3): skip the restart with a greppable line instead
+                // of panicking on this detached thread.
+                let c_args = match args
                     .iter()
-                    .map(|a| CString::new(a.clone()).unwrap())
-                    .collect();
+                    .map(|a| CString::new(a.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(c) => c,
+                    Err(_) => {
+                        eprintln!("{failure_prefix} restart skipped: null byte in argv");
+                        return;
+                    }
+                };
                 let mut ptrs: Vec<*const libc::c_char> =
                     c_args.iter().map(|a| a.as_ptr()).collect();
                 ptrs.push(std::ptr::null());
@@ -538,8 +562,9 @@ fn tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> 
             for c in chunks.iter().rev() {
                 buf.extend_from_slice(c);
             }
-            let text = std::str::from_utf8(&buf)
-                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
+            let text = std::str::from_utf8(&buf).map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8")
+            })?;
             let tail: Vec<String> = text.lines().rev().take(n).map(str::to_string).collect();
             return Ok(tail.into_iter().rev().collect());
         }
@@ -818,5 +843,46 @@ mod tests {
             .map(|l| l.as_str().unwrap().to_string())
             .collect();
         assert_eq!(arr, vec!["a", "b", "c"]);
+    }
+
+    /// Connected stream pair for exercising `read_request` directly.
+    fn socket_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let server = listener.accept().unwrap().0;
+        (server, client)
+    }
+
+    #[test]
+    fn read_request_rejects_header_flood_within_byte_budget() {
+        // 150 minimal headers: ~9 KiB total — well under MAX_HEADER_BYTES, but
+        // past the per-request header COUNT cap (audit finding 5.2).
+        let (mut server, client) = socket_pair();
+        std::thread::spawn(move || {
+            let mut client = client;
+            let mut req = String::from("GET /1/summary HTTP/1.1\r\nHost: x\r\n");
+            for i in 0..150 {
+                req.push_str(&format!("X-H{i}: v\r\n"));
+            }
+            req.push_str("\r\n");
+            let _ = client.write_all(req.as_bytes());
+        });
+        assert!(read_request(&mut server).is_none());
+    }
+
+    #[test]
+    fn read_request_still_parses_normal_header_counts() {
+        // Sanity: a normal request (few headers) is unaffected by the cap.
+        let (mut server, client) = socket_pair();
+        std::thread::spawn(move || {
+            let mut client = client;
+            let _ = client.write_all(
+                b"GET /1/summary HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer t\r\n\r\n",
+            );
+        });
+        let req = read_request(&mut server).expect("normal request must parse");
+        assert_eq!(req.method, "GET");
+        assert_eq!(req.headers.len(), 2);
     }
 }
