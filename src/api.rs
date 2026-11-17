@@ -518,20 +518,32 @@ fn tail_lines(path: &std::path::Path, n: usize) -> std::io::Result<Vec<String>> 
     }
     const CHUNK: u64 = 8 * 1024;
     let file_end = len;
-    let mut start = file_end.saturating_sub(CHUNK);
+    // Grow the window backward in fixed-size chunks, reading ONLY the newly
+    // expanded chunk [start, end) each iteration (each byte is read exactly
+    // once). The old shape re-read [start, file_end) wholesale per iteration —
+    // O(file size) I/O per poll on a log whose last `n` lines span many chunks.
+    let mut chunks: Vec<Vec<u8>> = Vec::new(); // newest first
+    let mut newlines = 0usize;
+    let mut end = file_end;
     loop {
+        let start = end.saturating_sub(CHUNK);
         f.seek(SeekFrom::Start(start))?;
-        let mut buf = vec![0u8; (file_end - start) as usize];
-        f.read_exact(&mut buf)?;
+        let mut chunk = vec![0u8; (end - start) as usize]; // only the new part
+        f.read_exact(&mut chunk)?;
+        newlines += chunk.iter().filter(|&&b| b == b'\n').count();
+        chunks.push(chunk);
         // Enough newlines to delimit `n` complete lines? Or did we reach EOF?
-        let newlines = buf.iter().filter(|&&b| b == b'\n').count();
         if newlines > n || start == 0 {
+            let mut buf = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
+            for c in chunks.iter().rev() {
+                buf.extend_from_slice(c);
+            }
             let text = std::str::from_utf8(&buf)
                 .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"))?;
             let tail: Vec<String> = text.lines().rev().take(n).map(str::to_string).collect();
             return Ok(tail.into_iter().rev().collect());
         }
-        start = start.saturating_sub(CHUNK); // grow the window backward, re-read a larger range
+        end = start; // grow the window backward, read only the new chunk next
     }
 }
 
@@ -748,5 +760,63 @@ mod tests {
         // The real clamp (lower bound): lines=1 still returns at least 50.
         let (_, v) = log_tail_of_file("lines=1", &path);
         assert_eq!(v["lines"].as_array().unwrap().len(), 50);
+    }
+
+    #[test]
+    fn log_tail_spans_many_chunks_without_rereading() {
+        // ~200 KiB of lines: the requested tail spans dozens of 8 KiB chunks,
+        // so the backward window must grow across many iterations. Each line is
+        // long enough that chunk boundaries fall mid-line (no alignment luck).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.log");
+        const TOTAL: u32 = 3000;
+        let body: String = (1..=TOTAL)
+            .map(|i| format!("line {i} {}", "x".repeat(56))) // ~64 B/line
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, &body).unwrap();
+
+        let (st, v) = log_tail_of_file("lines=100", &path);
+        assert_eq!(st, 200);
+        let arr: Vec<String> = v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(arr.len(), 100);
+        // Exact content, chronological — first returned line is TOTAL-99.
+        let expect = |i: u32| format!("line {i} {}", "x".repeat(56));
+        assert_eq!(arr[0], expect(TOTAL - 99));
+        assert_eq!(arr[99], expect(TOTAL));
+
+        // Max clamp (lines=2000) on the same file: still exact.
+        let (_, v) = log_tail_of_file("lines=9999", &path);
+        let arr: Vec<String> = v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(arr.len(), 2000);
+        assert_eq!(arr[0], expect(TOTAL - 1999));
+    }
+
+    #[test]
+    fn log_tail_without_trailing_newline_keeps_partial_last_line() {
+        // Pre-existing semantics: a final line lacking '\n' is still returned.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonl.log");
+        std::fs::write(&path, "a\nb\nc").unwrap();
+
+        let (st, v) = log_tail_of_file("lines=50", &path);
+        assert_eq!(st, 200);
+        let arr: Vec<String> = v["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(arr, vec!["a", "b", "c"]);
     }
 }
