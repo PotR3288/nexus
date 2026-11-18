@@ -1,0 +1,48 @@
+# Per-push quality gate (same shape as xtminer/edgecase ci.yml). This is a
+# library consumed by both miners via git pin, so the gate must cover what
+# consumers actually compile: --all-features exercises the optional `tokio`
+# feature (stratum_async), which sync-only local builds never touch.
+#   - fmt + clippy (0 warnings, -D warnings) + tests on Linux, stable toolchain
+#   - MSRV 1.87 test leg (rust-version in Cargo.toml)
+#   - native Windows MSVC leg: cfg(windows) paths (terminal SGR handling etc.)
+#     are compiled and tested under real MSVC on every push.
+
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request: {}
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy (stable, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (stable, all features)
+        run: cargo test --all-features
+
+      - name: MSRV 1.87
+        run: |
+          rustup toolchain install 1.87 --profile minimal
+          cargo +1.87 test --all-features
+
+  windows-msvc:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: clippy (MSVC, all features)
+        shell: pwsh
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: test (native Windows, MSVC)
+        shell: pwsh
+        run: cargo test --all-features

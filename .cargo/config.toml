@@ -1,0 +1,8 @@
+# MSRV-aware dependency resolution: prefer crate versions compatible with
+# `rust-version` (1.87) when resolving NEW dependencies, so a plain
+# `cargo update` cannot silently re-break the MSRV gate in ci.yml by pulling
+# a release that raised its own rust-version (happened to xtminer with
+# time 0.3.55 -> requires 1.88). Already-locked versions are untouched until
+# updated.
+[resolver]
+incompatible-rust-versions = "fallback"
