@@ -9,10 +9,11 @@
 //! time (blocks or sessions), yielding the configured portion of rewards in
 //! expectation — no protocol change, no per-block coinbase split.
 //!
-//! - [`DonationStrategy::Window`]: cron-like timed windows evaluated in UTC.
-//!   While a window is open the active donation address rotates deterministically.
 //! - [`DonationStrategy::Cycle`]: wall-clock-free rotation; a fixed fraction
 //!   of units (blocks/sessions) is donated, `cycle_len = ceil(1/fraction)`.
+//!   (A cron-window strategy existed previously but was removed as
+//!   unreachable: both consumers only ever build configs via
+//!   [`builtin_config`], which always selects Cycle.)
 //!
 //! Weighted rotation: with weights {3, 2} the donation slots 0-2 resolve to
 //! address 0 and slots 3-4 to address 1, repeating every `total_weight` units.
@@ -35,21 +36,15 @@ pub struct WeightedAddress {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DonationStrategy {
-    /// Cron-scheduled timed windows, evaluated in UTC.
-    Window {
-        schedule: String,
-        duration_minutes: u32,
-    },
     /// Deterministic fraction-of-units cycle, no wall clock.
     Cycle { fraction: f64 },
 }
 
 impl Default for DonationStrategy {
     fn default() -> Self {
-        DonationStrategy::Window {
-            schedule: String::new(),
-            duration_minutes: 0,
-        }
+        // Off by default: fraction 0 donates nothing, so an omitted strategy
+        // must never start donating.
+        DonationStrategy::Cycle { fraction: 0.0 }
     }
 }
 
@@ -128,14 +123,8 @@ pub fn resolve(cfg: &DonationConfig, input: &ResolveInput) -> Option<String> {
     if !cfg.enabled || cfg.addresses.is_empty() {
         return None;
     }
-    let open = match &cfg.strategy {
-        DonationStrategy::Cycle { fraction } => cycle_is_open(*fraction, input.rotation),
-        DonationStrategy::Window {
-            schedule,
-            duration_minutes,
-        } => window_is_open(schedule, *duration_minutes, input.now)?,
-    };
-    if !open {
+    let DonationStrategy::Cycle { fraction } = &cfg.strategy;
+    if !cycle_is_open(*fraction, input.rotation) {
         return None;
     }
     // Pick the address by DONATION-SLOT index, not raw rotation: with a Cycle
@@ -144,15 +133,12 @@ pub fn resolve(cfg: &DonationConfig, input: &ResolveInput) -> Option<String> {
     // (e.g. cycle_len 10, two addresses → every slot is even → the second
     // address never gets picked). Counting elapsed donation slots makes the
     // weighted split exact regardless of cycle length.
-    let pick_index = match &cfg.strategy {
-        DonationStrategy::Cycle { fraction } => {
-            let cycle_len = (1.0 / fraction).ceil().clamp(1.0, MAX_CYCLE_LEN as f64) as u64;
-            let open_slots = (fraction * cycle_len as f64)
-                .round()
-                .clamp(1.0, cycle_len as f64) as u64;
-            (input.rotation / cycle_len) * open_slots + (input.rotation % cycle_len).min(open_slots)
-        }
-        DonationStrategy::Window { .. } => input.rotation,
+    let pick_index = {
+        let cycle_len = (1.0 / fraction).ceil().clamp(1.0, MAX_CYCLE_LEN as f64) as u64;
+        let open_slots = (fraction * cycle_len as f64)
+            .round()
+            .clamp(1.0, cycle_len as f64) as u64;
+        (input.rotation / cycle_len) * open_slots + (input.rotation % cycle_len).min(open_slots)
     };
     Some(pick_address(&cfg.addresses, pick_index))
 }
@@ -171,32 +157,6 @@ fn cycle_is_open(fraction: f64, rotation: u64) -> bool {
         .round()
         .clamp(1.0, cycle_len as f64) as u64;
     rotation % cycle_len < open_slots
-}
-
-/// Window openness: true iff `now` falls inside an occurrence of `schedule`
-/// plus `duration_minutes`. Occurrences whose start is BEFORE now are scanned
-/// until one whose end is >= now, so a window that crosses midnight stays
-/// open on the morning side. UTC only.
-fn window_is_open(schedule: &str, duration_minutes: u32, now: SystemTime) -> Option<bool> {
-    use cron::Schedule;
-    use std::str::FromStr;
-    // Configs use the standard 5-field cron syntax (`min hour dom month dow`);
-    // the cron crate expects seconds first, so pad the expression.
-    let padded = format!("0 {schedule}");
-    let sched = Schedule::from_str(&padded).ok()?;
-    let now_utc: chrono::DateTime<chrono::Utc> = now.into();
-    // Scan the last 25h of occurrences (24h + slack) for one covering now.
-    let horizon = now_utc - chrono::Duration::hours(25);
-    for start in sched.after(&horizon) {
-        let end = start + chrono::Duration::minutes(duration_minutes as i64);
-        if start <= now_utc && now_utc < end {
-            return Some(true);
-        }
-        if start > now_utc {
-            return Some(false);
-        }
-    }
-    Some(false)
 }
 
 /// Deterministic weighted pick: target slot = rotation % total_weight,
